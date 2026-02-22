@@ -1,62 +1,51 @@
 // AudioEngine hook — Transformers.js MusicGen + Web Audio API integration
 //
-// Lazy-loads the model on first generate, runs inference client-side via
-// WebGPU (falls back to WASM), and plays back the result through Web Audio
-// with seamless looping and crossfade support.
+// The model downloads in the background on page load. The user focuses on
+// writing their prompt. A toast reports model readiness. Generation is only
+// enabled once the model is ready.
 
-const SAMPLE_RATE = 32000; // MusicGen outputs 32 kHz mono audio
 const CROSSFADE_DURATION = 2; // seconds
 
-let pipeline = null;
-let generator = null;
+let modelPromise = null;
 
-async function loadModel(hook) {
-  if (generator) return generator;
+function loadModel(hook) {
+  if (modelPromise) return modelPromise;
 
-  hook.pushEvent("generation-progress", { progress: 5, label: "Loading Transformers.js..." });
+  modelPromise = (async () => {
+    hook.pushEvent("model-status", { status: "loading", detail: "Loading Transformers.js..." });
 
-  const { pipeline: pipelineFn, env } = await import("@huggingface/transformers");
-  pipeline = pipelineFn;
+    const { AutoTokenizer, MusicgenForConditionalGeneration } = await import("@huggingface/transformers");
 
-  // Prefer WebGPU, fall back to WASM
-  env.backends.onnx.wasm.proxy = false;
+    hook.pushEvent("model-status", { status: "loading", detail: "Downloading tokenizer..." });
 
-  hook.pushEvent("generation-progress", { progress: 15, label: "Downloading MusicGen model..." });
+    const tokenizer = await AutoTokenizer.from_pretrained("Xenova/musicgen-small");
 
-  generator = await pipeline("text-to-audio", "Xenova/musicgen-small", {
-    dtype: "q4",
-    device: "webgpu",
-    progress_callback: (progress) => {
-      if (progress.status === "progress" && progress.total) {
-        const pct = Math.min(15 + Math.round((progress.loaded / progress.total) * 50), 65);
-        hook.pushEvent("generation-progress", {
-          progress: pct,
-          label: `Downloading model: ${progress.file || ""}`,
-        });
-      }
-    },
-  });
+    hook.pushEvent("model-status", { status: "downloading", detail: "Downloading MusicGen model..." });
 
-  hook.pushEvent("generation-progress", { progress: 70, label: "Model ready" });
-  return generator;
-}
+    const model = await MusicgenForConditionalGeneration.from_pretrained("Xenova/musicgen-small", {
+      dtype: "q4",
+      device: "webgpu",
+      progress_callback: (progress) => {
+        if (progress.status === "progress" && progress.total) {
+          const pct = Math.round((progress.loaded / progress.total) * 100);
+          hook.pushEvent("model-status", {
+            status: "downloading",
+            detail: `Downloading model: ${pct}%`,
+          });
+        }
+      },
+    });
 
-function createAudioContext() {
-  return new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
-}
+    const sampleRate = model.config.audio_encoder.sampling_rate;
 
-function playAudio(ctx, audioData, gainNode, loop = true) {
-  const buffer = ctx.createBuffer(1, audioData.length, SAMPLE_RATE);
-  buffer.getChannelData(0).set(audioData);
+    hook.pushEvent("model-status", { status: "ready", detail: "" });
 
-  const source = ctx.createBufferSource();
-  source.buffer = buffer;
-  source.loop = loop;
-  source.connect(gainNode);
-  gainNode.connect(ctx.destination);
-  source.start();
+    return { tokenizer, model, sampleRate };
+  })();
 
-  return source;
+  modelPromise.catch(() => { modelPromise = null; });
+
+  return modelPromise;
 }
 
 function crossfade(ctx, oldGain, newGain, duration = CROSSFADE_DURATION) {
@@ -66,13 +55,8 @@ function crossfade(ctx, oldGain, newGain, duration = CROSSFADE_DURATION) {
   newGain.gain.setValueAtTime(0, now);
   newGain.gain.linearRampToValueAtTime(1, now + duration);
 
-  // Disconnect old gain after fade completes
   setTimeout(() => {
-    try {
-      oldGain.disconnect();
-    } catch (_e) {
-      // already disconnected
-    }
+    try { oldGain.disconnect(); } catch (_e) { /* already disconnected */ }
   }, duration * 1000 + 100);
 }
 
@@ -82,73 +66,73 @@ const AudioEngine = {
     this.currentSource = null;
     this.currentGain = null;
 
-    this.handleEvent("generate-audio", async ({ prompt }) => {
-      await this.generate(prompt);
+    // Start downloading immediately in the background
+    loadModel(this);
+
+    this.handleEvent("generate-audio", ({ prompt }) => {
+      this.generate(prompt);
     });
 
-    // Listen for the generate button click from LiveView
-    this.el.closest("[phx-hook]") || this.el;
-    window.addEventListener("phx:generate", (e) => {
-      this.generate(e.detail.prompt);
+    this.handleEvent("stop-audio", () => {
+      if (this.currentSource) {
+        try { this.currentSource.stop(); } catch (_e) { /* already stopped */ }
+        this.currentSource = null;
+      }
+      if (this.currentGain) {
+        try { this.currentGain.disconnect(); } catch (_e) { /* already disconnected */ }
+        this.currentGain = null;
+      }
     });
   },
 
   async generate(prompt) {
-    if (!prompt) {
-      prompt = this.el.dataset.prompt;
-    }
     if (!prompt) return;
 
     try {
-      const gen = await loadModel(this);
+      const { tokenizer, model, sampleRate } = await loadModel(this);
 
-      this.pushEvent("generation-progress", { progress: 75, label: "Generating audio..." });
+      this.pushEvent("generation-progress", { progress: 50, label: "Generating audio..." });
 
-      const result = await gen(prompt, {
+      const inputs = tokenizer(prompt);
+      const audioValues = await model.generate({
+        ...inputs,
         max_new_tokens: 512,
-        callback_function: (output) => {
-          if (output && output.generated_token_ids) {
-            const total = 512;
-            const done = output.generated_token_ids.length;
-            const pct = Math.min(75 + Math.round((done / total) * 20), 95);
-            this.pushEvent("generation-progress", {
-              progress: pct,
-              label: "Generating audio...",
-            });
-          }
-        },
+        do_sample: true,
+        guidance_scale: 3,
       });
 
-      this.pushEvent("generation-progress", { progress: 98, label: "Starting playback..." });
+      this.pushEvent("generation-progress", { progress: 95, label: "Starting playback..." });
 
-      // Extract audio data from the pipeline result
-      const audioData = result.audio;
+      const audioData = audioValues.data;
       if (!audioData || audioData.length === 0) {
-        console.error("No audio data generated");
+        this.pushEvent("generation-progress", { progress: 0, label: "Error: no audio generated" });
         return;
       }
 
-      // Initialize audio context on first use (must be after user gesture)
       if (!this.audioCtx) {
-        this.audioCtx = createAudioContext();
+        this.audioCtx = new AudioContext({ sampleRate });
       }
 
-      const newGain = this.audioCtx.createGain();
+      const buffer = this.audioCtx.createBuffer(1, audioData.length, sampleRate);
+      buffer.getChannelData(0).set(audioData instanceof Float32Array ? audioData : new Float32Array(audioData));
 
-      // Crossfade if there's already something playing
+      const newGain = this.audioCtx.createGain();
+      const source = this.audioCtx.createBufferSource();
+      source.buffer = buffer;
+      source.loop = true;
+      source.connect(newGain);
+      newGain.connect(this.audioCtx.destination);
+
       if (this.currentSource && this.currentGain) {
         crossfade(this.audioCtx, this.currentGain, newGain);
         const oldSource = this.currentSource;
         setTimeout(() => {
-          try {
-            oldSource.stop();
-          } catch (_e) {
-            // already stopped
-          }
+          try { oldSource.stop(); } catch (_e) { /* already stopped */ }
         }, CROSSFADE_DURATION * 1000 + 100);
       }
 
-      this.currentSource = playAudio(this.audioCtx, audioData, newGain, true);
+      source.start();
+      this.currentSource = source;
       this.currentGain = newGain;
 
       this.pushEvent("generation-complete", {});
@@ -163,11 +147,7 @@ const AudioEngine = {
 
   destroyed() {
     if (this.currentSource) {
-      try {
-        this.currentSource.stop();
-      } catch (_e) {
-        // already stopped
-      }
+      try { this.currentSource.stop(); } catch (_e) { /* already stopped */ }
     }
     if (this.audioCtx) {
       this.audioCtx.close();
