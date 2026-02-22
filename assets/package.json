@@ -1,0 +1,7 @@
+{
+  "name": "driftscape-assets",
+  "private": true,
+  "dependencies": {
+    "@huggingface/transformers": "^3.0.0"
+  }
+}
