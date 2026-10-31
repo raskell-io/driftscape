@@ -1,4 +1,26 @@
-# Driftscape
+<p align="center">
+  <img src=".github/brand/driftscape-icon.svg" alt="" width="96" height="96">
+</p>
+
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/brand/driftscape-wordmark-dark.svg">
+    <img alt="Driftscape" src=".github/brand/driftscape-wordmark-light.svg" height="56">
+  </picture>
+</h1>
+
+<p align="center">
+  <em>Ambient soundscapes: composable, location-aware, generated in your browser.</em>
+</p>
+
+Driftscape is a listening platform for ambient music and soundscapes. Tracks are small and loop
+gaplessly, scenes are layered from loops and field recordings, and a MusicGen model runs on the
+listener's own GPU through WebGPU, so generation costs the server nothing. Later, soundscapes can be
+tied to places and shift as you move. Built with Phoenix.
+
+---
+
+## Development
 
 To start your Phoenix server:
 
