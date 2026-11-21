@@ -35,7 +35,9 @@ Planned: `crates/wasm` (C ABI over core, no wasm-bindgen),
 - `cargo run --release -p driftscape-infer --features metal --example parity -- <model dir>` compares the GPU decoder's
   logits with the ONNX one. Step 0 must correlate at 1.00; later steps ~0.93–0.98 (q4 noise). Run it after any change
   to `gpu.rs`.
-- `--example stepcost` splits a GPU step into CPU queueing and GPU time. Real time needs < 20 ms per step.
+- `--example stepcost <model dir> [position]` splits a GPU step into CPU queueing and GPU time at a sequence
+  position. Real time needs < 20 ms per step; currently ~9 ms at 20, ~10.5 ms at 400, ~12 ms at 1000 (M4, q8_0).
+  Check a late position too: per-step costs that grow with the sequence hide in early-position measurements.
 - Env knobs: `DRIFTSCAPE_TRACE=1` (stage timings), `DRIFTSCAPE_QUANT=q8_0|q4k|none` (GPU weight quantization, default q8_0; q4k loses accuracy),
   `DRIFTSCAPE_DTYPE=f16|bf16` (GPU precision when QUANT=none),
   `DRIFTSCAPE_THREADS=n` (ONNX CPU threads).

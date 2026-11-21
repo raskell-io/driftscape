@@ -40,10 +40,14 @@ fn heads(x: &Tensor) -> Result<Tensor> {
 }
 
 /// `softmax(q kᵀ / √d) v`, fused into one kernel on Metal.
+///
+/// `k` and `v` may be strided views into the preallocated KV cache; the Metal kernel reads them as they are. Do not
+/// make them contiguous: that copies the whole cache in every layer at every step, and step time then grows with the
+/// sequence (45 ms instead of 10.5 ms at position 400).
 fn attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
     let scale = (HEAD_DIM as f32).powf(-0.5);
     if q.device().is_metal() {
-        return Ok(candle_nn::ops::sdpa(q, &k.contiguous()?, &v.contiguous()?, None, false, scale, 1.0)?);
+        return Ok(candle_nn::ops::sdpa(q, k, v, None, false, scale, 1.0)?);
     }
     let scores = (q.matmul(&k.t()?)? * f64::from(scale))?;
     Ok(candle_nn::ops::softmax_last_dim(&scores)?.matmul(v)?)

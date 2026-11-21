@@ -8,8 +8,10 @@ fn main() -> anyhow::Result<()> {
     let seq = 8;
     gpu.start(&vec![0.01; 2 * seq * 768], &[1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0], seq)?;
     let tokens = vec![7i64; 8];
-    for _ in 0..20 {
-        gpu.step(&tokens)?; // warm up kernels
+    // Measure at a sequence position: e.g. 400 for the end of an 8-second clip. At least 20 steps of warm-up.
+    let at: usize = std::env::args().nth(2).and_then(|a| a.parse().ok()).unwrap_or(20).max(20);
+    for _ in 0..at {
+        gpu.step(&tokens)?;
     }
     let (mut queue, mut total) = (0.0, 0.0);
     let n = 100;
@@ -20,6 +22,10 @@ fn main() -> anyhow::Result<()> {
         let _ = pending.flatten_all()?.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?;
         total += t.elapsed().as_secs_f64();
     }
-    println!("per step: {:.1} ms total, {:.1} ms queueing on the CPU", total / n as f64 * 1e3, queue / n as f64 * 1e3);
+    println!(
+        "at position {at}, per step: {:.1} ms total, {:.1} ms queueing on the CPU",
+        total / n as f64 * 1e3,
+        queue / n as f64 * 1e3
+    );
     Ok(())
 }
