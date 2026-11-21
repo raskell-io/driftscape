@@ -31,6 +31,16 @@ Planned: `crates/wasm` (C ABI over core, no wasm-bindgen),
 - If the next segment is late, the control loop crossfades back to the current segment's `rejoin` point (bar-aligned
   for genres with `bpm`). The next segment still continues from the buffer's end, which comes round again.
 - The audio callback only applies commands and mixes; buffers are freed on the control thread.
+- A tweak bumps a version counter: the waiting segment is dropped, the one being generated is cancelled (via the
+  progress callback), and the next is made from the *playing* segment's tokens. It is short (6 s), marked urgent, and
+  crossfades in (3 s) as soon as it's ready. Measured delay: 5–10 s.
+- Segments stay full length otherwise: each replays the overlap first, so short segments lose throughput. The overlap
+  is fed as one batch (`Decoder::prefill`; GPU: 150 positions in ~160 ms instead of ~1.35 s; `--example prefill`
+  checks it matches stepping).
+- The control loop warns if the audio clock stops (device change). `:quit` and Ctrl-C never wait on a lock; a second
+  Ctrl-C exits at once.
+- Open: one session (2026-11-21) went silent after a urgent transition and ignored `:quit` for ~55 min. Not
+  reproduced since; the hardening above addresses the plausible causes. `DRIFTSCAPE_TRACE=1` prints a clock heartbeat.
 - Adding a preset: drop a TOML file in `presets/` and list it in `crates/core/src/preset.rs`; the tests check it.
 
 ## Rules

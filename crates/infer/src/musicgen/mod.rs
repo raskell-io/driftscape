@@ -15,7 +15,7 @@ pub mod gpu;
 pub mod onnx;
 
 use crate::{
-    Clip, Progress, Request, Tokens, Voice,
+    Cancelled, Clip, ControlFlow, Progress, Request, Tokens, Voice,
     sampling::{Rng, top_k},
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -40,6 +40,15 @@ pub trait Decoder {
     /// Feed one token per row (`2 * CODEBOOKS` rows: batch-major, codebook-minor) and return the logits for the next
     /// position, `[2 * CODEBOOKS, VOCAB]` in the same row order.
     fn step(&mut self, tokens: &[i64]) -> Result<Vec<f32>>;
+    /// Feed several consecutive positions whose tokens are all known (a continuation's replayed overlap) and return
+    /// the logits after the last. Backends that can run them as one batch should; this default steps through them.
+    fn prefill(&mut self, positions: &[Vec<i64>]) -> Result<Vec<f32>> {
+        let mut logits = Vec::new();
+        for tokens in positions {
+            logits = self.step(tokens)?;
+        }
+        Ok(logits)
+    }
 }
 
 /// Which decoder backend to run.
@@ -130,7 +139,7 @@ fn forced_token(k: usize, p: usize, len: usize, prefix: Option<&Tokens>) -> Opti
 }
 
 impl Voice for MusicGen {
-    fn generate(&mut self, request: &Request, progress: &mut dyn FnMut(Progress)) -> Result<Clip> {
+    fn generate(&mut self, request: &Request, progress: &mut dyn FnMut(Progress) -> ControlFlow<()>) -> Result<Clip> {
         let prefix = request.continue_from.as_ref();
         let prefix_frames = prefix.map_or(0, Tokens::frames);
         if let Some(t) = prefix
@@ -163,16 +172,32 @@ impl Voice for MusicGen {
         self.decoder.start(&states, &mask, seq)?;
 
         let mut tokens = vec![vec![PAD; len]; CODEBOOKS]; // the conditional batch's sequence per codebook
-        let mut next = vec![PAD; 2 * CODEBOOKS];
         let mut rng = Rng::new(request.seed);
         let mut scratch = Vec::with_capacity(VOCAB);
         let mut guided = vec![0f32; VOCAB];
+        // The decoder input for a position: its tokens for both batches (the same tokens, batch-major).
+        let input = |tokens: &[Vec<i64>], q: usize| -> Vec<i64> {
+            (0..2).flat_map(|_| tokens.iter().map(move |c| c[q])).collect()
+        };
 
         let t0 = std::time::Instant::now();
-        for p in 1..=steps {
-            let logits = self.decoder.step(&next).with_context(|| format!("decoder step {p}"))?;
+        // Positions whose tokens are all forced (the start token and a continuation's overlap) are fed in one batch.
+        let known = (0..len)
+            .take_while(|&q| q == 0 || (0..CODEBOOKS).all(|k| forced_token(k, q, len, prefix).is_some()))
+            .count();
+        for q in 1..known {
             for (k, sequence) in tokens.iter_mut().enumerate() {
-                let token = if let Some(t) = forced_token(k, p, len, prefix) {
+                sequence[q] = forced_token(k, q, len, prefix).expect("known positions are forced");
+            }
+        }
+        let positions: Vec<Vec<i64>> = (0..known).map(|q| input(&tokens, q)).collect();
+        let mut logits = self.decoder.prefill(&positions).context("prefill")?;
+        for p in known..=steps {
+            if p > known {
+                logits = self.decoder.step(&input(&tokens, p - 1)).with_context(|| format!("decoder step {p}"))?;
+            }
+            for (k, sequence) in tokens.iter_mut().enumerate() {
+                sequence[p] = if let Some(t) = forced_token(k, p, len, prefix) {
                     t
                 } else {
                     let (cond, uncond) = (&logits[k * VOCAB..][..VOCAB], &logits[(CODEBOOKS + k) * VOCAB..][..VOCAB]);
@@ -181,11 +206,10 @@ impl Voice for MusicGen {
                     }
                     top_k(&guided, request.top_k, request.temperature, &mut rng, &mut scratch) as i64
                 };
-                sequence[p] = token;
-                next[k] = token;
-                next[CODEBOOKS + k] = token;
             }
-            progress(Progress { step: p, total: steps });
+            if progress(Progress { step: p, total: steps }).is_break() {
+                return Err(Cancelled.into());
+            }
         }
         trace("decoder", t0);
 

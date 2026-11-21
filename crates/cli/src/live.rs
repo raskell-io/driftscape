@@ -24,7 +24,7 @@ use driftscape_core::{
     tempo,
 };
 use driftscape_infer::{
-    Request, Tokens, Voice,
+    ControlFlow, Request, Tokens, Voice, is_cancelled,
     musicgen::{Backend, MusicGen},
 };
 use std::{
@@ -33,7 +33,6 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc,
     },
     thread,
     time::Duration,
@@ -65,9 +64,20 @@ struct Params {
     variety: f32,
 }
 
+/// State shared by the generator, the control loop and the input thread.
+struct Shared {
+    params: Params,
+    /// The finished segment waiting to play next.
+    ready: Option<Segment>,
+    /// Tokens of the segment playing now. A generation that a tweak cancels restarts from here, so the music still
+    /// continues from what is audible.
+    playing: Option<Tokens>,
+}
+
 /// A finished segment, at the output rate.
 struct Segment {
     buffer: Buffer,
+    tokens: Tokens,
     /// Frames at the start that replay the previous segment's end.
     overlap: usize,
     /// Crossfade into this segment, and out of it when it repeats.
@@ -75,6 +85,8 @@ struct Segment {
     /// Where to jump back to if this segment has to repeat: its last `crossfade` frames sound like the ones from here.
     rejoin: usize,
     label: String,
+    /// The first segment after a tweak: it comes in as soon as it is ready instead of at the current one's end.
+    urgent: bool,
 }
 
 /// Mixer state the control loop tracks.
@@ -93,6 +105,12 @@ impl Playing {
     }
 }
 
+/// New audio in the first segment after a tweak.
+const URGENT_SECONDS: f32 = 6.0;
+
+/// Crossfade for a change the listener asked for, which doesn't wait for matching material.
+const CHANGE_FADE_SECONDS: f32 = 3.0;
+
 /// Typical loudness for a segment (about -20 dBFS RMS), and limits on the gain used to get there.
 const TARGET_RMS: f32 = 0.1;
 const MAX_GAIN: f32 = 8.0;
@@ -105,7 +123,13 @@ pub fn run(options: Options) -> Result<()> {
     if config.sample_format() != cpal::SampleFormat::F32 {
         bail!("output device wants {:?} samples; only f32 is supported so far", config.sample_format());
     }
-    let config: cpal::StreamConfig = config.into();
+    // Latency doesn't matter here and the model keeps the machine busy, so ask for a roomy buffer.
+    let buffer_size = match config.buffer_size() {
+        cpal::SupportedBufferSize::Range { min, max } => cpal::BufferSize::Fixed(2048.clamp(*min, *max)),
+        cpal::SupportedBufferSize::Unknown => cpal::BufferSize::Default,
+    };
+    let mut config: cpal::StreamConfig = config.into();
+    config.buffer_size = buffer_size;
     let rate = config.sample_rate;
     let channels = usize::from(config.channels);
 
@@ -113,27 +137,38 @@ pub fn run(options: Options) -> Result<()> {
         Source::Live { genre, prompt } => (genre, prompt, None),
         Source::Radio { station, genre } => (genre, String::new(), Some(station)),
     };
-    let params = Arc::new(Mutex::new(Params { genre, prompt, focus: 0.0, variety: 0.0 }));
+    let shared = Arc::new(Mutex::new(Shared {
+        params: Params { genre, prompt, focus: 0.0, variety: 0.0 },
+        ready: None,
+        playing: None,
+    }));
+    // Bumped by every tweak. The generator checks it every step and starts over when it changes.
+    let version = Arc::new(AtomicU64::new(0));
     let quit = Arc::new(AtomicBool::new(false));
     {
         let quit = quit.clone();
-        ctrlc::set_handler(move || quit.store(true, Ordering::SeqCst)).context("installing the Ctrl-C handler")?;
+        // The first Ctrl-C stops cleanly (and saves the recording); a second one exits at once, whatever is stuck.
+        ctrlc::set_handler(move || {
+            if quit.swap(true, Ordering::SeqCst) {
+                eprintln!("\nstopped");
+                std::process::exit(130);
+            }
+        })
+        .context("installing the Ctrl-C handler")?;
     }
 
-    // Generator → control: one finished segment waits while the next is being made.
-    let (segment_tx, segment_rx) = mpsc::sync_channel::<Segment>(1);
+    let clock = Arc::new(AtomicU64::new(0));
     let generator = {
-        let (params, quit, station) = (params.clone(), quit.clone(), station.clone());
+        let (shared, version, quit, station) = (shared.clone(), version.clone(), quit.clone(), station.clone());
         thread::Builder::new()
             .name("generator".into())
-            .spawn(move || generate_loop(options.backend, rate, params, station, segment_tx, quit))?
+            .spawn(move || generate_loop(options.backend, rate, shared, version, station, quit))?
     };
 
     // Control → audio: commands; audio → control: finished buffers to drop; audio → recorder: played samples.
     let (mut command_tx, mut command_rx) = rtrb::RingBuffer::<Command>::new(64);
     let (mut finished_tx, mut finished_rx) = rtrb::RingBuffer::<Buffer>::new(64);
     let (mut record_tx, mut record_rx) = rtrb::RingBuffer::<f32>::new(rate as usize * 4);
-    let clock = Arc::new(AtomicU64::new(0));
     let callback_clock = clock.clone();
     let mut mixer = Mixer::new();
     let mut leveler = Leveler::new(rate, TARGET_RMS, 3.0);
@@ -199,11 +234,11 @@ pub fn run(options: Options) -> Result<()> {
         None => None,
     };
 
-    spawn_input(params.clone(), quit.clone(), station.is_some());
+    spawn_input(shared.clone(), version.clone(), quit.clone(), station.is_some());
     match &station {
         Some(s) => eprintln!("📻 {} · {}", s.name, s.description),
         None => {
-            let p = params.lock().unwrap();
+            let p = &shared.lock().unwrap().params;
             eprintln!(
                 "live · {} · {}",
                 p.genre.name,
@@ -222,6 +257,10 @@ pub fn run(options: Options) -> Result<()> {
     let lookahead = LOOKAHEAD * u64::from(rate) / 48_000;
     let mut playing: Option<Playing> = None;
     let mut next_id = 1u64;
+    let trace = std::env::var_os("DRIFTSCAPE_TRACE").is_some();
+    const STALL: Duration = Duration::from_secs(2);
+    let (mut last_clock, mut stalled_since, mut stall_reported) = (0u64, None::<std::time::Instant>, false);
+    let mut last_trace = u64::MAX;
     let deadline = options.stop_after.map(|m| std::time::Instant::now() + Duration::from_secs_f64(m * 60.0));
     while !quit.load(Ordering::Acquire) {
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
@@ -232,10 +271,39 @@ pub fn run(options: Options) -> Result<()> {
             drop(buffer); // freed here, not in the audio callback
         }
         let now = clock.load(Ordering::Acquire);
+        // The audio callback advances the clock. If it stops (the output device went away or changed), say so
+        // instead of waiting silently.
+        if now != last_clock {
+            if stalled_since.take().is_some_and(|t| t.elapsed() > STALL) {
+                eprintln!("  audio output resumed");
+            }
+            last_clock = now;
+        } else if playing.is_some() {
+            let since = *stalled_since.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() > STALL && !stall_reported {
+                stall_reported = true;
+                eprintln!(
+                    "  the audio output stopped (did the output device change?); Ctrl-C to stop, or reconnect the device"
+                );
+            }
+        }
+        if stalled_since.is_none() {
+            stall_reported = false;
+        }
+        if trace && now / u64::from(rate) != last_trace {
+            last_trace = now / u64::from(rate);
+            let ready = shared.lock().unwrap().ready.as_ref().map(|r| r.urgent);
+            eprintln!(
+                "[trace] clock {:.1} s · playing ends {:?} · ready {:?}",
+                now as f64 / f64::from(rate),
+                playing.as_ref().map(|p| format!("{:.1}", p.end() as f64 / f64::from(rate))),
+                ready
+            );
+        }
         match &playing {
             None => {
                 // Wait for the first segment, then start it with a short fade-in.
-                if let Ok(segment) = segment_rx.recv_timeout(Duration::from_millis(50)) {
+                if let Some(segment) = take_ready(&shared) {
                     let segment = Arc::new(segment);
                     let at = now + lookahead;
                     let id = next_id;
@@ -247,22 +315,43 @@ pub fn run(options: Options) -> Result<()> {
                     eprintln!("▶ {}", segment.label);
                     playing = Some(Playing { id, segment, start: at, offset: 0 });
                 }
-                continue;
             }
             Some(current) => {
+                // A change the listener asked for comes in now, with a longer crossfade, once the current
+                // segment's own fade-in is over.
+                let urgent_ready = shared.lock().unwrap().ready.as_ref().is_some_and(|r| r.urgent);
+                let change_fade = (CHANGE_FADE_SECONDS * rate as f32) as usize;
+                let at_now = now + lookahead;
+                if urgent_ready
+                    && at_now >= current.start + current.segment.crossfade as u64
+                    && at_now + (change_fade as u64) < current.end()
+                    && let Some(segment) = take_ready(&shared)
+                {
+                    let id = next_id;
+                    next_id += 1;
+                    let offset = segment.overlap.saturating_sub(change_fade);
+                    eprintln!("▶ {}", segment.label);
+                    push(&mut command_tx, Command::FadeOut { id: current.id, at: at_now, fade: change_fade });
+                    push(
+                        &mut command_tx,
+                        Command::Play { id, buffer: segment.buffer.clone(), offset, at: at_now, fade_in: change_fade },
+                    );
+                    playing = Some(Playing { id, segment: Arc::new(segment), start: at_now, offset });
+                    continue;
+                }
                 let fade = current.segment.crossfade;
                 let at = current.end() - fade as u64;
                 if now + lookahead >= at {
                     let id = next_id;
                     next_id += 1;
-                    let next = match segment_rx.try_recv() {
-                        Ok(segment) => {
+                    let next = match take_ready(&shared) {
+                        Some(segment) => {
                             // The new segment's frame `overlap - fade` sounds like the current one's `len - fade`.
                             let offset = segment.overlap.saturating_sub(fade);
                             eprintln!("▶ {}", segment.label);
                             Playing { id, segment: Arc::new(segment), start: at, offset }
                         }
-                        Err(_) => {
+                        None => {
                             eprintln!("↺ repeating while the next segment is generated");
                             Playing { id, segment: current.segment.clone(), start: at, offset: current.segment.rejoin }
                         }
@@ -286,8 +375,6 @@ pub fn run(options: Options) -> Result<()> {
     }
 
     eprintln!("\nstopping…");
-    // Let the generator notice and finish; it may be mid-segment.
-    drop(segment_rx);
     drop(stream);
     if let Some(recorder) = recorder {
         let wav = recorder.join().map_err(|_| anyhow!("recorder thread panicked"))??;
@@ -299,6 +386,14 @@ pub fn run(options: Options) -> Result<()> {
     Ok(())
 }
 
+/// Take the waiting segment, if any, and mark it as the one playing. One lock, so a tweak can't slip in between.
+fn take_ready(shared: &Mutex<Shared>) -> Option<Segment> {
+    let mut s = shared.lock().unwrap();
+    let segment = s.ready.take()?;
+    s.playing = Some(segment.tokens.clone());
+    Some(segment)
+}
+
 fn push(tx: &mut rtrb::Producer<Command>, command: Command) {
     if tx.push(command).is_err() {
         eprintln!("warning: audio command queue full");
@@ -306,12 +401,15 @@ fn push(tx: &mut rtrb::Producer<Command>, command: Command) {
 }
 
 /// Make segments until told to stop.
+///
+/// Each segment continues from the previous one. A tweak (a change of `version`) cancels the segment being made and
+/// discards a finished one that has not started; the next one then continues from the segment playing now.
 fn generate_loop(
     backend: Backend,
     rate: u32,
-    params: Arc<Mutex<Params>>,
+    shared: Arc<Mutex<Shared>>,
+    version: Arc<AtomicU64>,
     station: Option<Station>,
-    segments: mpsc::SyncSender<Segment>,
     quit: Arc<AtomicBool>,
 ) {
     let result = (|| -> Result<()> {
@@ -320,11 +418,11 @@ fn generate_loop(
         let mut previous: Option<Tokens> = None;
         let mut gain = None::<f32>;
         let mut seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos() as u64;
-        for number in 0.. {
-            if quit.load(Ordering::Acquire) {
-                break;
-            }
-            let p = params.lock().unwrap().clone();
+        let mut number = 0u64;
+        let mut placed_version = 0u64; // the tweak version of the last segment handed over
+        'segments: while !quit.load(Ordering::Acquire) {
+            let v = version.load(Ordering::Acquire);
+            let p = shared.lock().unwrap().params.clone();
             let listener = match &station {
                 Some(s) => s.prompt_for(number),
                 None => &p.prompt,
@@ -332,14 +430,29 @@ fn generate_loop(
             let g = &p.genre;
             let continue_from = previous.as_ref().map(|t| t.tail(g.overlap_seconds));
             seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            // Right at the start and after a tweak, a short segment gets music (or the change) to the listener
+            // sooner. Otherwise full length: every segment first replays the overlap, which costs time without adding
+            // new audio, so long segments are what keep generation ahead of playback.
+            let urgent = v != placed_version || number == 0;
+            let seconds = if urgent { g.segment_seconds.min(URGENT_SECONDS) } else { g.segment_seconds };
             let request = Request {
                 guidance: (g.guidance + p.focus).clamp(1.0, 8.0),
                 temperature: (g.temperature + p.variety).clamp(0.5, 1.6),
                 continue_from,
-                ..Request::new(g.prompt(listener), g.segment_seconds, seed)
+                ..Request::new(g.prompt(listener), seconds, seed)
             };
             let started = std::time::Instant::now();
-            let clip = voice.generate(&request, &mut |_| {})?;
+            let stale = || quit.load(Ordering::Acquire) || version.load(Ordering::Acquire) != v;
+            let clip = match voice.generate(&request, &mut |_| {
+                if stale() { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
+            }) {
+                Ok(clip) => clip,
+                Err(e) if is_cancelled(&e) => {
+                    previous = shared.lock().unwrap().playing.clone();
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             let took = started.elapsed().as_secs_f32();
 
             let audio = resample(&clip.audio, rate);
@@ -356,17 +469,38 @@ fn generate_loop(
             let crossfade = ((g.crossfade_seconds * rate as f32) as usize).min(overlap.max(rate as usize));
             let rejoin = rejoin_for(&audio, g, rate, overlap, crossfade);
             let label = format!(
-                "segment {} · {} · {:.0} s in {:.1} s ({:.1}× real time)",
+                "segment {} · {} · {} · {:.0} s in {:.1} s ({:.1}× real time)",
                 number + 1,
+                g.name,
                 truncate(listener_or_default(listener, g), 48),
-                g.segment_seconds,
+                seconds,
                 took,
-                g.segment_seconds / took
+                seconds / took
             );
-            previous = Some(clip.tokens);
-            if segments.send(Segment { buffer, overlap, crossfade, rejoin, label }).is_err() {
-                break; // the session ended
+            let mut segment = Some(Segment { buffer, tokens: clip.tokens, overlap, crossfade, rejoin, label, urgent });
+
+            // Wait for the slot to free up; if a tweak arrives meanwhile, this segment is stale.
+            loop {
+                if quit.load(Ordering::Acquire) {
+                    break 'segments;
+                }
+                {
+                    let mut s = shared.lock().unwrap();
+                    if version.load(Ordering::Acquire) != v {
+                        previous = s.playing.clone();
+                        continue 'segments;
+                    }
+                    if s.ready.is_none() {
+                        let seg = segment.take().expect("placed once");
+                        previous = Some(seg.tokens.clone());
+                        s.ready = Some(seg);
+                        placed_version = v;
+                        break;
+                    }
+                }
+                thread::sleep(Duration::from_millis(20));
             }
+            number += 1;
         }
         Ok(())
     })();
@@ -405,56 +539,79 @@ fn truncate(s: &str, n: usize) -> String {
 }
 
 /// Read tweaks from the terminal, one per line.
-fn spawn_input(params: Arc<Mutex<Params>>, quit: Arc<AtomicBool>, radio: bool) {
+fn spawn_input(shared: Arc<Mutex<Shared>>, version: Arc<AtomicU64>, quit: Arc<AtomicBool>, radio: bool) {
     thread::spawn(move || {
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
             let Ok(line) = line else { break };
             let line = line.trim();
+            if std::env::var_os("DRIFTSCAPE_TRACE").is_some() {
+                eprintln!("[trace] input {line:?}");
+            }
             if line.is_empty() {
                 continue;
             }
-            let mut p = params.lock().unwrap();
+            // Quitting must never wait on anything.
+            if matches!(line, ":q" | ":quit") {
+                quit.store(true, Ordering::Release);
+                break;
+            }
+            // Messages are printed after the lock is released, so console output never holds up the other threads.
+            let mut messages: Vec<String> = Vec::new();
+            macro_rules! say {
+                ($($arg:tt)*) => { messages.push(format!($($arg)*)) };
+            }
+            let mut guard = shared.lock().unwrap();
+            let before =
+                (guard.params.genre.id.clone(), guard.params.prompt.clone(), guard.params.focus, guard.params.variety);
+            let p = &mut guard.params;
             let mut words = line.split_whitespace();
             match words.next().unwrap_or("") {
-                ":q" | ":quit" => {
-                    quit.store(true, Ordering::Release);
-                    break;
-                }
-                ":help" => eprintln!(
+                ":help" => say!(
                     "  <text>            new prompt (next segment)\n  :genre <id>       switch genre: {}\n  :focus + | -      follow the prompt more or less closely\n  :variety + | -    let the music wander more or less\n  :status           show the current settings\n  :quit             stop and save the recording",
                     builtin_genres().iter().map(|g| g.id.as_str()).collect::<Vec<_>>().join(", ")
                 ),
                 ":genre" if !radio => {
                     match words.next().and_then(|id| builtin_genres().into_iter().find(|g| g.id == id)) {
                         Some(g) => {
-                            eprintln!("  genre → {} (from the next segment)", g.name);
+                            say!("  genre → {}", g.name);
                             p.genre = g;
                         }
-                        None => eprintln!("  unknown genre; :help lists them"),
+                        None => say!("  unknown genre; :help lists them"),
                     }
                 }
                 ":focus" => {
                     p.focus += if words.next() == Some("-") { -0.5 } else { 0.5 };
-                    eprintln!("  focus {:+.1}", p.focus);
+                    say!("  focus {:+.1}", p.focus);
                 }
                 ":variety" => {
                     p.variety += if words.next() == Some("-") { -0.1 } else { 0.1 };
-                    eprintln!("  variety {:+.1}", p.variety);
+                    say!("  variety {:+.1}", p.variety);
                 }
-                ":status" => eprintln!(
+                ":status" => say!(
                     "  {} · {} · focus {:+.1} · variety {:+.1}",
                     p.genre.name,
                     listener_or_default(&p.prompt, &p.genre),
                     p.focus,
                     p.variety
                 ),
-                _ if line.starts_with(':') => eprintln!("  unknown command; :help lists them"),
-                _ if radio => eprintln!("  radio plays its station's prompts; use `driftscape live` to steer"),
+                _ if line.starts_with(':') => say!("  unknown command; :help lists them"),
+                _ if radio => say!("  radio plays its station's prompts; use `driftscape live` to steer"),
                 _ => {
                     p.prompt = line.to_owned();
-                    eprintln!("  prompt → {line} (from the next segment)");
+                    say!("  prompt → {line}");
                 }
+            }
+            let p = &guard.params;
+            if (p.genre.id.clone(), p.prompt.clone(), p.focus, p.variety) != before {
+                // Start over from what is playing: drop the waiting segment, cancel the one being made.
+                guard.ready = None;
+                version.fetch_add(1, Ordering::AcqRel);
+                say!("  (generating with the change; you'll hear it in about one segment's time)");
+            }
+            drop(guard);
+            for m in messages {
+                eprintln!("{m}");
             }
         }
     });

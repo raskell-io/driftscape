@@ -7,6 +7,7 @@ pub mod musicgen;
 mod sampling;
 
 use driftscape_core::Audio;
+pub use std::ops::ControlFlow;
 
 /// What to generate.
 #[derive(Debug, Clone)]
@@ -72,8 +73,30 @@ pub struct Progress {
 
 /// A model that generates audio.
 pub trait Voice {
-    /// Generate a clip. `progress` is called after every step.
-    fn generate(&mut self, request: &Request, progress: &mut dyn FnMut(Progress)) -> anyhow::Result<Clip>;
+    /// Generate a clip. `progress` is called after every step; returning [`ControlFlow::Break`] cancels the
+    /// generation, which then fails with [`Cancelled`].
+    fn generate(
+        &mut self,
+        request: &Request,
+        progress: &mut dyn FnMut(Progress) -> ControlFlow<()>,
+    ) -> anyhow::Result<Clip>;
+}
+
+/// The error a generation fails with when its progress callback cancels it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("generation cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+/// Whether an error is a cancellation rather than a failure.
+pub fn is_cancelled(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<Cancelled>().is_some()
 }
 
 #[cfg(test)]

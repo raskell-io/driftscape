@@ -21,9 +21,11 @@ fn main() -> anyhow::Result<()> {
     let env = ort::environment::init().with_telemetry(false).build()?;
     let mut voice = MusicGen::load(&env, &dir, Backend::Gpu)?;
     let prompt = "slow warm ambient pads, soft piano";
-    let a = voice.generate(&Request::new(prompt, 8.0, 1), &mut |_| {})?;
+    let a = voice.generate(&Request::new(prompt, 8.0, 1), &mut |_| driftscape_infer::ControlFlow::Continue(()))?;
     let b = voice
-        .generate(&Request { continue_from: Some(a.tokens.tail(3.0)), ..Request::new(prompt, 5.0, 2) }, &mut |_| {})?;
+        .generate(&Request { continue_from: Some(a.tokens.tail(3.0)), ..Request::new(prompt, 5.0, 2) }, &mut |_| {
+            driftscape_infer::ControlFlow::Continue(())
+        })?;
     let sr = 32_000usize;
     let overlap = 3 * sr;
     println!("a {:.2} s, b {:.2} s, b overlap {:.2} s", a.audio.seconds(), b.audio.seconds(), b.overlap_seconds);

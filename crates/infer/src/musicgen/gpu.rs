@@ -39,6 +39,27 @@ fn heads(x: &Tensor) -> Result<Tensor> {
     Ok(x.reshape((b, s, HEADS, HEAD_DIM))?.transpose(1, 2)?.contiguous()?)
 }
 
+/// Attention for several new positions at once (prefill), each seeing the cache and the new positions up to itself.
+/// Runs once per segment, so it takes the plain path rather than a fused kernel.
+fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+    let (_, _, n, _) = q.dims4()?;
+    let total = k.dim(2)?;
+    let past = total - n;
+    let mask: Vec<f32> =
+        (0..n).flat_map(|i| (0..total).map(move |j| if j <= past + i { 0.0 } else { f32::NEG_INFINITY })).collect();
+    let mask = Tensor::from_vec(mask, (1, 1, n, total), q.device())?.to_dtype(q.dtype())?;
+    let scale = f64::from((HEAD_DIM as f32).powf(-0.5));
+    let scores = (q.matmul(&k.contiguous()?.t()?)? * scale)?.broadcast_add(&mask)?;
+    Ok(candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v.contiguous()?)?)
+}
+
+/// Cross-attention for several positions at once; no mask (see the module notes).
+fn plain_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+    let scale = f64::from((HEAD_DIM as f32).powf(-0.5));
+    let scores = (q.matmul(&k.t()?)? * scale)?;
+    Ok(candle_nn::ops::softmax_last_dim(&scores)?.matmul(v)?)
+}
+
 /// `softmax(q kᵀ / √d) v`, fused into one kernel on Metal.
 ///
 /// `k` and `v` may be strided views into the preallocated KV cache; the Metal kernel reads them as they are. Do not
@@ -156,19 +177,23 @@ impl Layer {
     }
 
     fn forward(&mut self, x: &Tensor) -> Result<Tensor> {
-        // Self-attention over everything so far. One new position per step, so no causal mask is needed.
+        // Self-attention over everything so far. One new position per step needs no causal mask; several (prefill)
+        // do.
+        let n = x.dim(1)?;
         let h = self.self_norm.forward(x)?;
         let qkv = self.self_qkv.forward(&h)?;
         let q = heads(&qkv.narrow(2, 0, HIDDEN)?)?;
         let k = heads(&qkv.narrow(2, HIDDEN, HIDDEN)?)?;
         let v = heads(&qkv.narrow(2, 2 * HIDDEN, HIDDEN)?)?;
         let (k, v) = self.cache.append(&k, &v)?;
-        let x = (x + self.self_out.forward(&merge(&attention(&q, &k, &v)?)?)?)?;
+        let a = if n == 1 { attention(&q, &k, &v)? } else { causal_attention(&q, &k, &v)? };
+        let x = (x + self.self_out.forward(&merge(&a)?)?)?;
 
         let h = self.cross_norm.forward(&x)?;
         let (ck, cv) = self.cross.as_ref().ok_or_else(|| anyhow!("decoder not started"))?;
         let q = heads(&self.cross_q.forward(&h)?)?;
-        let x = (&x + self.cross_out.forward(&merge(&attention(&q, ck, cv)?)?)?)?;
+        let a = if n == 1 { attention(&q, ck, cv)? } else { plain_attention(&q, ck, cv)? };
+        let x = (&x + self.cross_out.forward(&merge(&a)?)?)?;
 
         let h = self.ffn_norm.forward(&x)?;
         let h = self.fc2.forward(&self.fc1.forward(&h)?.gelu_erf()?)?;
@@ -276,25 +301,40 @@ impl Decoder for GpuDecoder {
         let logits = self.step_lazy(tokens)?;
         Ok(logits.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?)
     }
+
+    fn prefill(&mut self, positions: &[Vec<i64>]) -> Result<Vec<f32>> {
+        let logits = self.forward(positions)?;
+        Ok(logits.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?)
+    }
 }
 
 impl GpuDecoder {
     /// One step without reading the result back: the logits stay on the device. For profiling.
     pub fn step_lazy(&mut self, tokens: &[i64]) -> Result<Tensor> {
-        // Sum the codebook embeddings per batch row: rows are batch-major, codebook-minor.
-        let mut x = self.positions.narrow(0, self.position, 1)?.broadcast_as((2, HIDDEN))?.contiguous()?;
+        self.forward(std::slice::from_ref(&tokens.to_vec()))
+    }
+
+    /// Run `positions.len()` consecutive positions (each `2 * CODEBOOKS` tokens, batch-major) and return the logits of
+    /// the last, `[2, 1, codebooks * vocab]`.
+    fn forward(&mut self, positions: &[Vec<i64>]) -> Result<Tensor> {
+        let n = positions.len();
+        // Sum the codebook embeddings per batch row and position: [2, n, hidden].
+        let mut x =
+            self.positions.narrow(0, self.position, n)?.unsqueeze(0)?.broadcast_as((2, n, HIDDEN))?.contiguous()?;
         for (k, embed) in self.embed.iter().enumerate() {
-            let ids: Vec<u32> = (0..2).map(|b| tokens[b * CODEBOOKS + k] as u32).collect();
-            x = (x + embed.forward(&Tensor::from_vec(ids, 2, &self.device)?)?)?;
+            let ids: Vec<u32> =
+                (0..2).flat_map(|b| positions.iter().map(move |t| t[b * CODEBOOKS + k] as u32)).collect();
+            x = (x + embed.forward(&Tensor::from_vec(ids, (2, n), &self.device)?)?)?;
         }
-        let mut x = x.unsqueeze(1)?; // [2, 1, hidden]
         for layer in &mut self.layers {
             x = layer.forward(&x)?;
         }
-        self.position += 1;
+        self.position += n;
 
-        // [2, 1, codebooks * vocab]: batch-major, codebook-minor rows once flattened, like the tokens.
-        Ok(self.heads.forward(&self.norm.forward(&x)?)?)
+        // Only the last position's logits are needed. [2, 1, codebooks * vocab]: batch-major, codebook-minor rows
+        // once flattened, like the tokens.
+        let last = x.narrow(1, n - 1, 1)?;
+        Ok(self.heads.forward(&self.norm.forward(&last)?)?)
     }
 }
 

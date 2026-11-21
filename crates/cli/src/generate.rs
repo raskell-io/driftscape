@@ -3,7 +3,7 @@
 use anyhow::{Context, Result, bail};
 use driftscape_core::wav::SampleFormat;
 use driftscape_infer::{
-    Request, Voice,
+    ControlFlow, Request, Voice,
     musicgen::{Backend, MusicGen},
 };
 use std::{
@@ -40,6 +40,7 @@ pub fn run(prompt: &str, seconds: f32, seed: u64, guidance: f32, backend: Backen
             eprint!("\rgenerating {:>3}%  {:>5.1} s", p.step * 100 / p.total, elapsed);
             let _ = std::io::stderr().flush();
         }
+        ControlFlow::Continue(())
     })?;
     let audio = clip.audio;
     let took = started.elapsed().as_secs_f32();
