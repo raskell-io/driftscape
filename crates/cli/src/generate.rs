@@ -1,16 +1,12 @@
 //! `driftscape gen`: load a voice from the model cache and generate a clip.
 
 use anyhow::{Context, Result, bail};
-use driftscape_core::wav::SampleFormat;
+use driftscape_core::Audio;
 use driftscape_infer::{
     ControlFlow, Request, Voice,
     musicgen::{Backend, MusicGen},
 };
-use std::{
-    io::Write,
-    path::{Path, PathBuf},
-    time::Instant,
-};
+use std::{io::Write, path::PathBuf, time::Instant};
 
 /// Where models live: `~/Library/Application Support/Driftscape/models` on macOS, `~/.local/share/driftscape/models`
 /// on Linux. The CLI and the plugin share it.
@@ -20,7 +16,8 @@ pub fn models_dir() -> Result<PathBuf> {
     Ok(base.join(app).join("models"))
 }
 
-pub fn run(prompt: &str, seconds: f32, seed: u64, guidance: f32, backend: Backend, output: &Path) -> Result<()> {
+/// Generate a clip and return it.
+pub fn run(prompt: &str, seconds: f32, seed: u64, guidance: f32, backend: Backend) -> Result<Audio> {
     let dir = models_dir()?.join("musicgen-small");
     if !dir.join("tokenizer.json").exists() {
         bail!("MusicGen is not in {}; download Xenova/musicgen-small (q4 ONNX files) there", dir.display());
@@ -51,7 +48,5 @@ pub fn run(prompt: &str, seconds: f32, seed: u64, guidance: f32, backend: Backen
         took,
         audio.seconds() as f32 / took
     );
-    crate::write(output, &audio, SampleFormat::Pcm24)?;
-    eprintln!("wrote {}", output.display());
-    Ok(())
+    Ok(audio)
 }

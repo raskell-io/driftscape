@@ -5,3 +5,13 @@ run = ["cargo test --workspace", "cargo clippy --workspace --all-targets -- -D w
 [tasks.install]
 description = "Install the driftscape CLI into ~/.cargo/bin"
 run = "cargo install --path crates/cli --locked"
+
+[tasks.web]
+description = "Build the web app into web/build (core wasm, presets, ONNX runtime, then SvelteKit)"
+dir = "web"
+run = ["npm ci", "npm run build", "npm test"]
+
+[tasks.serve]
+description = "Build the web app, embed it in the CLI, and open it with the native engine"
+depends = ["web"]
+run = "cargo run --release -p driftscape -- serve"

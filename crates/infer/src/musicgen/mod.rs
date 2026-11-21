@@ -34,7 +34,7 @@ const SAMPLE_RATE: u32 = 32_000;
 pub const MAX_SECONDS: f32 = 30.0;
 
 /// The token decoder: given the text states once, then the previous tokens each step, return logits.
-pub trait Decoder {
+pub trait Decoder: Send {
     /// Start a new sequence. `states` is `[2, seq, 768]` (conditional, then unconditional batch), `mask` is `[2, seq]`.
     fn start(&mut self, states: &[f32], mask: &[i64], seq: usize) -> Result<()>;
     /// Feed one token per row (`2 * CODEBOOKS` rows: batch-major, codebook-minor) and return the logits for the next

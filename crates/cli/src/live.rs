@@ -468,8 +468,17 @@ fn generate_loop(
             let overlap = (clip.overlap_seconds * rate as f32) as usize;
             let crossfade = ((g.crossfade_seconds * rate as f32) as usize).min(overlap.max(rate as usize));
             let rejoin = rejoin_for(&audio, g, rate, overlap, crossfade);
+            // For genres with a beat, report the tempo the new part actually plays at.
+            let pulse = match g.bpm {
+                Some(_) => match tempo::estimate(&samples[overlap.min(samples.len())..], rate, tempo::Range::default())
+                {
+                    Some(t) => format!(" · {:.1} BPM", t.bpm),
+                    None => " · no pulse".to_owned(),
+                },
+                None => String::new(),
+            };
             let label = format!(
-                "segment {} · {} · {} · {:.0} s in {:.1} s ({:.1}× real time)",
+                "segment {} · {} · {} · {:.0} s in {:.1} s ({:.1}× real time){pulse}",
                 number + 1,
                 g.name,
                 truncate(listener_or_default(listener, g), 48),

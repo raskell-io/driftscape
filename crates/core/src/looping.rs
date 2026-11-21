@@ -289,3 +289,112 @@ mod tests {
         assert!(j.channels[0].iter().all(|&s| (1.0..=1.42).contains(&s)));
     }
 }
+
+/// A loop fitted to a tempo: stretched from the tempo the clip was played at to the target, then cut to whole bars.
+#[derive(Debug, Clone)]
+pub struct Fitted {
+    pub looped: Loop,
+    /// The clip's own tempo, as given or detected.
+    pub played_bpm: f64,
+    /// How much the clip was stretched (played / target).
+    pub ratio: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FitError {
+    /// The clip has no steady pulse to measure; pass its tempo explicitly.
+    NoPulse,
+    /// The clip's tempo is too far from the target to stretch cleanly (more than ±25 %).
+    TooFar {
+        played_bpm: f64,
+        target_bpm: f64,
+    },
+    Loop(LoopError),
+}
+
+impl std::fmt::Display for FitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoPulse => write!(f, "the clip has no steady pulse to measure; give its tempo explicitly"),
+            Self::TooFar { played_bpm, target_bpm } => {
+                write!(f, "the clip plays at {played_bpm} BPM, too far from {target_bpm} BPM to stretch cleanly")
+            }
+            Self::Loop(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for FitError {}
+
+/// Fit `clip` to `bars` bars of `beats_per_bar` at `target_bpm`. The clip's own tempo is `played_bpm` if given,
+/// otherwise detected; a detection at half or double speed is folded to the nearest octave of the target.
+pub fn fit_loop(
+    clip: &Audio,
+    target_bpm: f64,
+    bars: u32,
+    beats_per_bar: u32,
+    crossfade_seconds: f64,
+    played_bpm: Option<f64>,
+) -> Result<Fitted, FitError> {
+    let detected =
+        || crate::tempo::estimate(&clip.mixdown(), clip.sample_rate, crate::tempo::Range::default()).map(|t| t.bpm);
+    let mut played = played_bpm.or_else(detected).ok_or(FitError::NoPulse)?;
+    while played < target_bpm / std::f64::consts::SQRT_2 {
+        played *= 2.0;
+    }
+    while played > target_bpm * std::f64::consts::SQRT_2 {
+        played /= 2.0;
+    }
+    let ratio = played / target_bpm;
+    if !(0.8..=1.25).contains(&ratio) {
+        return Err(FitError::TooFar { played_bpm: played, target_bpm });
+    }
+    let stretched = if (ratio - 1.0).abs() < 1e-4 { clip.clone() } else { crate::stretch::stretch(clip, ratio) };
+    let spec = LoopSpec::bars(bars, beats_per_bar, target_bpm, clip.sample_rate, crossfade_seconds);
+    let looped = make_loop(&stretched, spec).map_err(FitError::Loop)?;
+    Ok(Fitted { looped, played_bpm: played, ratio })
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::*;
+
+    fn clicks(bpm: f64, seconds: f64, rate: u32) -> Audio {
+        let n = (seconds * f64::from(rate)) as usize;
+        let period = 60.0 / bpm * f64::from(rate);
+        let mut x = vec![0.0f32; n];
+        let mut b = 0;
+        while ((b as f64) * period) < n as f64 {
+            let s = (b as f64 * period) as usize;
+            for i in 0..400.min(n - s) {
+                x[s + i] = ((i * 7919 % 13) as f32 / 6.5 - 1.0) * (-(i as f32) / 80.0).exp();
+            }
+            b += 1;
+        }
+        Audio::mono(rate, x)
+    }
+
+    #[test]
+    fn fits_a_slightly_slow_clip_to_exact_bars() {
+        let clip = clicks(116.0, 20.0, 16_000);
+        let fit = fit_loop(&clip, 118.0, 4, 4, 0.1, None).unwrap();
+        assert!((fit.played_bpm - 116.0).abs() < 0.2, "{}", fit.played_bpm);
+        // Exactly 4 bars at 118 BPM.
+        assert_eq!(fit.looped.audio.len(), (16.0 * 60.0 / 118.0 * 16_000.0f64).round() as usize);
+        let t = crate::tempo::estimate(&fit.looped.audio.channels[0], 16_000, crate::tempo::Range::default());
+        assert!((t.unwrap().bpm - 118.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn folds_a_half_speed_detection() {
+        let clip = clicks(118.0, 20.0, 16_000);
+        let fit = fit_loop(&clip, 118.0, 2, 4, 0.1, Some(59.0)).unwrap();
+        assert!((fit.ratio - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn refuses_a_tempo_too_far_away() {
+        let clip = clicks(90.0, 20.0, 16_000);
+        assert!(matches!(fit_loop(&clip, 120.0, 2, 4, 0.1, Some(90.0)), Err(FitError::TooFar { .. })));
+    }
+}

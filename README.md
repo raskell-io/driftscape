@@ -30,10 +30,18 @@ driftscape live --genre ambient-techno                # ambient, synthetic-ambie
 driftscape radio                                      # list stations
 driftscape radio deep-space --stop-after 45           # a station, with a sleep timer
 driftscape gen "warm ambient pads" --seconds 10 -o pads.wav
+driftscape gen "dub techno, soft kick" --bpm 118 --bars 8 --rate 48000 -o dub.wav   # DAW-ready loop
 driftscape loop pads.wav --bars 4 -o loop.wav         # cut a seamless loop
+driftscape loop dub.wav --bars 4 --to-bpm 124 -o dub-124.wav   # refit to another tempo
 ```
 
 Live and radio sessions are recorded to `~/Music/Driftscape` (`--record <path>` or `--no-record`).
+
+### In the browser
+
+`driftscape serve` opens the web app on this machine with the native engine behind it. The same app also runs on its
+own as a static site: MusicGen then runs in the browser on WebGPU (about half real time on an M4, so live mode repeats
+more), and the model (about 570 MB) is downloaded once and cached.
 
 The model files (MusicGen small) go in `~/Library/Application Support/Driftscape/models/musicgen-small/`:
 `tokenizer.json` and `onnx/{text_encoder,decoder_model_merged,encodec_decode}_q4.onnx` from
@@ -45,6 +53,8 @@ CC-BY-NC 4.0.
 
 ```bash
 mise run test                                         # tests, clippy, fmt
+mise run web                                          # build the web app into web/build
+mise run serve                                        # web app + native engine at localhost:4321
 cargo run --release -p driftscape -- live
 ```
 

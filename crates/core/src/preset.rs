@@ -4,9 +4,9 @@
 //! sampling and segment timing. A [`Station`] is radio mode's unit: a genre and a rotation of prompts. The presets that
 //! ship with Driftscape live in `presets/` at the repository root and are compiled in; see [`builtin_genres`].
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Genre {
     pub id: String,
@@ -42,7 +42,7 @@ impl Genre {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Station {
     pub id: String,

@@ -4,12 +4,13 @@ mod generate;
 mod live;
 mod play;
 mod recorder;
+mod serve;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use driftscape_core::{
     Audio,
-    looping::{LoopSpec, make_loop},
+    looping::{LoopSpec, fit_loop, make_loop},
     preset,
     resample::resample,
     tempo,
@@ -27,15 +28,27 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Generate a clip from a text prompt, on this machine.
+    ///
+    /// With --bpm and --bars the result is a seamless loop of exactly that many bars at exactly that tempo, ready to
+    /// drop into a DAW session: the model is asked for the tempo, then the clip is measured, stretched and cut.
     Gen {
         /// What it should sound like.
         prompt: String,
         /// Where to write the clip.
         #[arg(short, long)]
         output: PathBuf,
-        /// Length in seconds (up to 30).
+        /// Length in seconds (up to 30). Ignored with --bars.
         #[arg(long, default_value_t = 10.0)]
         seconds: f32,
+        /// Tempo to ask for, and to fit the loop to with --bars.
+        #[arg(long)]
+        bpm: Option<f64>,
+        /// Make a seamless loop of this many bars of 4/4 at --bpm.
+        #[arg(long, requires = "bpm")]
+        bars: Option<u32>,
+        /// Output sample rate, e.g. 48000 for a DAW session. Defaults to the model's 32000.
+        #[arg(long)]
+        rate: Option<u32>,
         /// Random seed. The same seed and prompt give the same clip.
         #[arg(long)]
         seed: Option<u64>,
@@ -62,6 +75,23 @@ enum Command {
         #[command(flatten)]
         session: SessionArgs,
     },
+    /// Open the web app on this machine, with the native engine behind it (faster than in the browser).
+    Serve {
+        #[arg(long, default_value_t = 4321)]
+        port: u16,
+        /// Run the model on the GPU or the CPU.
+        #[arg(long, value_enum, default_value_t = Device::Gpu)]
+        device: Device,
+        /// Don't open a browser.
+        #[arg(long)]
+        no_open: bool,
+    },
+    /// List the genres and stations.
+    Presets {
+        /// Print them as JSON (what the web app loads).
+        #[arg(long)]
+        json: bool,
+    },
     /// Turn an audio clip into a seamless loop.
     ///
     /// With --bars the loop is a whole number of bars at the clip's tempo (detected, or given with --bpm).
@@ -75,9 +105,12 @@ enum Command {
         /// Loop length in bars of 4/4.
         #[arg(long, conflicts_with = "seconds")]
         bars: Option<u32>,
-        /// Tempo in BPM, when detection gets it wrong or the clip has no clear pulse.
+        /// The clip's tempo in BPM, when detection gets it wrong or the clip has no clear pulse.
         #[arg(long, requires = "bars")]
         bpm: Option<f64>,
+        /// Stretch the clip to this tempo first, so the loop is whole bars at exactly this BPM.
+        #[arg(long, requires = "bars")]
+        to_bpm: Option<f64>,
         /// Loop length in seconds.
         #[arg(long)]
         seconds: Option<f64>,
@@ -169,6 +202,25 @@ fn main() -> Result<()> {
                 stop_after: session.stop_after,
             })?;
         }
+        Command::Serve { port, device, no_open } => serve::run(port, device.into(), !no_open)?,
+        Command::Presets { json } => {
+            let (genres, stations) = (preset::builtin_genres(), preset::builtin_stations());
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({ "genres": genres, "stations": stations }))?
+                );
+            } else {
+                println!("genres:");
+                for g in &genres {
+                    println!("  {:<20} {}", g.id, g.description);
+                }
+                println!("stations:");
+                for s in &stations {
+                    println!("  {:<20} {} ({})", s.id, s.description, s.genre);
+                }
+            }
+        }
         Command::Radio { station, session } => {
             let stations = preset::builtin_stations();
             let Some(id) = station else {
@@ -191,15 +243,65 @@ fn main() -> Result<()> {
                 stop_after: session.stop_after,
             })?;
         }
-        Command::Gen { prompt, output, seconds, seed, guidance, device } => {
+        Command::Gen { prompt, output, seconds, bpm, bars, rate, seed, guidance, device } => {
             let seed = seed.unwrap_or_else(|| {
                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64)
             });
-            generate::run(&prompt, seconds, seed, guidance, device.into(), &output)?;
+            let prompt = match bpm {
+                Some(b) => format!("{prompt}, {b:.0} BPM"),
+                None => prompt,
+            };
+            let audio = match (bars, bpm) {
+                (Some(bars), Some(bpm)) => {
+                    // Enough for the bars after a stretch of up to 25 %, plus room to choose a start and crossfade.
+                    let needed = f64::from(bars) * 4.0 * 60.0 / bpm;
+                    let seconds = (needed * 1.25 + 1.5).min(30.0) as f32;
+                    if needed + 0.5 > 30.0 {
+                        bail!("{bars} bars at {bpm} BPM is {needed:.1} s; MusicGen makes at most 30 s");
+                    }
+                    let clip = generate::run(&prompt, seconds, seed, guidance, device.into())?;
+                    let fit = fit_loop(&clip, bpm, bars, 4, 0.05, None).context(
+                        "fitting the clip to the tempo (try another --seed, or a prompt with a clearer beat)",
+                    )?;
+                    eprintln!(
+                        "played at {:.2} BPM, stretched by {:.2} % to {bpm} BPM; {bars} bars = {:.2} s, seam similarity {:.2}",
+                        fit.played_bpm,
+                        (fit.ratio - 1.0) * 100.0,
+                        fit.looped.audio.seconds(),
+                        fit.looped.seam_similarity
+                    );
+                    fit.looped.audio
+                }
+                _ => generate::run(&prompt, seconds, seed, guidance, device.into())?,
+            };
+            let mut audio = match rate {
+                Some(r) => resample(&audio, r),
+                None => audio,
+            };
+            // The model's output can exceed full scale; bring the peak to -1 dBFS so nothing clips.
+            audio.normalize(0.89);
+            write(&output, &audio, SampleFormat::Pcm24)?;
+            eprintln!("wrote {} ({:.2} s, {} Hz)", output.display(), audio.seconds(), audio.sample_rate);
         }
-        Command::Loop { input, output, bars, bpm, seconds, crossfade_ms, rate, format } => {
+        Command::Loop { input, output, bars, bpm, to_bpm, seconds, crossfade_ms, rate, format } => {
             let clip = read(&input)?;
             let crossfade = crossfade_ms / 1000.0;
+            if let (Some(bars), Some(target)) = (bars, to_bpm) {
+                let fit = fit_loop(&clip, target, bars, 4, crossfade, bpm)?;
+                eprintln!(
+                    "played at {:.2} BPM, stretched by {:.2} % to {target} BPM; seam similarity {:.2}",
+                    fit.played_bpm,
+                    (fit.ratio - 1.0) * 100.0,
+                    fit.looped.seam_similarity
+                );
+                let audio = match rate {
+                    Some(r) => resample(&fit.looped.audio, r),
+                    None => fit.looped.audio,
+                };
+                write(&output, &audio, format.into())?;
+                eprintln!("wrote {} ({:.2} s, {} Hz)", output.display(), audio.seconds(), audio.sample_rate);
+                return Ok(());
+            }
             let spec = match (bars, seconds) {
                 (Some(bars), _) => {
                     let bpm = match bpm {
