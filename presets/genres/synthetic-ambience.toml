@@ -3,6 +3,8 @@ id = "synthetic-ambience"
 name = "Synthetic ambience"
 description = "Synthesizer textures and melodic drones for rooms that don't exist."
 template = "{prompt}. Ambient synthesizer soundscape, analog synth drones, slowly modulating textures, shimmering arpeggios far in the background, no drums"
+# A few words that carry this genre into a blend with another (the terrain pad in the web app).
+flavor = "analog synth drones and shimmering textures"
 default_prompt = "observation deck of a slow starship"
 guidance = 3.0
 temperature = 1.05

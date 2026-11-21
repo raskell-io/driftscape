@@ -4,6 +4,8 @@ id = "thematic"
 name = "Thematic"
 description = "Inspired by soundtracks: game worlds, film scores, shows."
 template = "{prompt}. Soundtrack style background music, instrumental, loopable, calm, no vocals"
+# A few words that carry this genre into a blend with another (the terrain pad in the web app).
+flavor = "soundtrack-like woodwinds and strings"
 default_prompt = "16-bit fantasy role-playing game overworld, gentle flute and harp, chiptune textures"
 guidance = 3.5
 temperature = 1.0

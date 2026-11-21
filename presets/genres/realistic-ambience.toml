@@ -4,6 +4,8 @@ id = "realistic-ambience"
 name = "Realistic ambience"
 description = "Places as they sound: rain, caves, campfires, taverns."
 template = "{prompt}. Field recording ambience, natural environmental sounds, realistic room tone, very quiet soft drone underneath, no melody, no drums"
+# A few words that carry this genre into a blend with another (the terrain pad in the web app).
+flavor = "natural field recording textures"
 default_prompt = "steady rain on leaves, distant thunder"
 guidance = 3.5
 temperature = 0.95

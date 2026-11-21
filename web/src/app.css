@@ -1,5 +1,5 @@
 /* Driftscape: dusk palette from the brand icon, Sora for display, Inter for text, JetBrains Mono for labels and data.
-   Dark-first (people listen at night), with a light theme for the day. */
+   One dark look: the app is an instrument, and people listen at night. */
 :root {
   --bg: #17142c;
   --surface: #201c3a;
@@ -10,6 +10,7 @@
   --peach: #ffb08f;
   --rose: #e48bb0;
   --violet: #a993f0;
+  --apricot: #ffd3a1;
   --accent: var(--peach);
   --on-accent: #24204a;
   --good: #6fd0a2;
@@ -18,23 +19,6 @@
   --body: "Inter Variable", system-ui, -apple-system, sans-serif;
   --mono: "JetBrains Mono Variable", ui-monospace, "SF Mono", Menlo, monospace;
   color-scheme: dark;
-}
-@media (prefers-color-scheme: light) {
-  :root {
-    --bg: #fbf7f4;
-    --surface: #ffffff;
-    --raised: #f3ecf3;
-    --ink: #24204a;
-    --muted: #625c80;
-    --line: #e7dfe0;
-    --peach: #e8876f;
-    --rose: #b0507a;
-    --violet: #5b4a9e;
-    --accent: #5b4a9e;
-    --on-accent: #ffffff;
-    --good: #2f7d5b;
-    color-scheme: light;
-  }
 }
 
 * { box-sizing: border-box; }

@@ -14,6 +14,8 @@ pub struct Genre {
     pub description: String,
     /// The prompt sent to the model; `{prompt}` is replaced by the listener's words and `{bpm}` by the tempo.
     pub template: String,
+    /// A few words that carry this genre into a blend with another, e.g. "a soft deep kick pulse".
+    pub flavor: String,
     /// What plays when the listener has not typed anything.
     pub default_prompt: String,
     pub guidance: f32,
@@ -112,6 +114,7 @@ mod tests {
         for (g, (file, _)) in genres.iter().zip(GENRES) {
             assert_eq!(g.id, file, "file name and id differ");
             assert!(g.template.contains("{prompt}"), "{} has no {{prompt}}", g.id);
+            assert!(!g.flavor.is_empty() && g.flavor.len() < 60, "{}: flavor should be a few words", g.id);
             assert_eq!(g.template.contains("{bpm}"), g.bpm.is_some(), "{}: {{bpm}} and bpm go together", g.id);
             // The crossfade sits at the end of the overlap; keep it half a second clear of the continued clip's start,
             // where the audio decoder has the least context.

@@ -3,6 +3,8 @@ id = "ambient-techno"
 name = "Ambient techno"
 description = "Pads over a soft four-on-the-floor pulse."
 template = "{prompt}. Ambient techno at {bpm} BPM, soft deep kick drum on every beat, muted hi-hats, warm dub chords, long reverb tails, steady groove"
+# A few words that carry this genre into a blend with another (the terrain pad in the web app).
+flavor = "a soft deep kick pulse"
 default_prompt = "late night drive through a sleeping city"
 guidance = 3.0
 temperature = 1.0

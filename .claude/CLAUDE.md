@@ -71,6 +71,12 @@ Planned: `crates/plugin` (nih-plug CLAP, wrapped to VST3/AU with clap-wrapper), 
 - Service worker: a new deploy waits; the page shows "A new version is ready · Reload" and only then sends
   `skip-waiting`. Never reload on `controllerchange` unless the listener asked (a first install also fires it).
 - The voice worker warms up WebGPU after loading (two tiny generations) so the first play doesn't compile shaders.
+- - UI (chosen 2026-11-21; see the concept page https://claude.ai/artifact/5FKYXGJzmyuxeDDCmRGKmr): instruments, calm
+  rather than skeuomorphic. Live = Terrain (web/src/lib/ui/Terrain.svelte, logic in terrain.js): genres are hills on a
+  contour map, the dot's position gives a genre plus a blended second one (Genre.flavor words). Dragging steers urgently;
+  the Drift knob's autopilot steers gently (engine.tweak(..., {urgent: false}) only shapes the next part). Radio =
+  Receiver.svelte: a tuning dial over a band; resting on a station for 0.7 s tunes in. One dark theme.
+- Inline `style` attributes are blocked by the CSP: set CSS variables from script (`el.style.setProperty`).
 - - The app picks NativeVoice when `/api/health` answers `{"engine":"driftscape"}`, else WorkerVoice.
 
 ## Rules

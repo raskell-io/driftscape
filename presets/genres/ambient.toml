@@ -4,6 +4,8 @@ name = "Ambient"
 description = "Slow harmony, soft pads and a lot of space."
 # {prompt} is replaced with what the listener types. The rest steers the model toward the genre.
 template = "{prompt}. Ambient music, slow evolving pads, soft warm textures, gentle harmony, spacious reverb, no drums"
+# A few words that carry this genre into a blend with another (the terrain pad in the web app).
+flavor = "slow evolving pads and soft harmony"
 default_prompt = "dusk over a quiet harbour"
 guidance = 3.0
 temperature = 1.0

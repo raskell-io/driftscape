@@ -54,7 +54,7 @@ export class LiveEngine {
    * Start a session. Must be called from a user gesture (it creates the AudioContext). With `resume` (a snapshot from
    * store.js) the snapshot's segment plays at once and generation continues from its tokens.
    */
-  async start({ genre, prompt = "", station = null, focus = 0, variety = 0, resume = null }) {
+  async start({ genre, prompt = "", station = null, focus = 0, variety = 0, blend = null, resume = null }) {
     if (this.running) this.stop();
     this.ctx ??= new AudioContext({ latencyHint: "playback" });
     await this.ctx.resume();
@@ -62,10 +62,14 @@ export class LiveEngine {
       await this.ctx.audioWorklet.addModule("/worklets/output.js");
       this.output = new AudioWorkletNode(this.ctx, "driftscape-output", { outputChannelCount: [2] });
       this.output.port.onmessage = ({ data }) => this.#capture(data);
-      this.bus = new GainNode(this.ctx);
+      this.bus = new GainNode(this.ctx, { gain: this.level ?? 1 });
       this.bus.connect(this.output).connect(this.ctx.destination);
+      // For the visuals: how loud the output is right now.
+      this.analyser = new AnalyserNode(this.ctx, { fftSize: 1024 });
+      this.output.connect(this.analyser);
+      this.scope = new Float32Array(this.analyser.fftSize);
     }
-    this.params = { genre, prompt, focus, variety };
+    this.params = { genre, prompt, focus, variety, blend };
     this.station = station;
     this.version++;
     this.ready = null;
@@ -101,16 +105,37 @@ export class LiveEngine {
     this.onEvent({ type: "state", playing: false });
   }
 
-  /** Change what plays next: { prompt?, genre?, focus?, variety? }. */
-  tweak(change) {
+  /**
+   * Change what plays: { prompt?, genre?, blend?, focus?, variety? }. `blend` is a second genre mixed in
+   * ({ genre, share }), from the terrain pad.
+   *
+   * An urgent tweak (the default: the listener asked for something) drops the waiting segment, cancels the one being
+   * made, and brings the change in within seconds. A gentle one (the terrain's autopilot drifting) only changes what
+   * the next segment is made from, so the music evolves without interruptions.
+   */
+  tweak(change, { urgent = true } = {}) {
     if (!this.params) return;
     const before = JSON.stringify(this.params);
     this.params = { ...this.params, ...change };
-    if (JSON.stringify(this.params) === before) return;
-    // Start over from what is playing: drop the waiting segment, cancel the one being made.
+    if (JSON.stringify(this.params) === before || !urgent) return;
     this.ready = null;
     this.version++;
     this.abort?.abort();
+  }
+
+  /** The output's loudness right now (RMS, roughly 0..0.4), for the visuals. */
+  loudness() {
+    if (!this.analyser || !this.running) return 0;
+    this.analyser.getFloatTimeDomainData(this.scope);
+    let sum = 0;
+    for (const v of this.scope) sum += v * v;
+    return Math.sqrt(sum / this.scope.length);
+  }
+
+  /** Master level, 0..1. */
+  setLevel(level) {
+    this.level = level;
+    if (this.bus) this.bus.gain.setTargetAtTime(level, this.ctx.currentTime, 0.1);
   }
 
   // ---- recording ---------------------------------------------------------------------------------------------------
@@ -173,7 +198,7 @@ export class LiveEngine {
     let gain = null;
     while (this.running) {
       const v = this.version;
-      const { genre: g, prompt, focus, variety } = this.params;
+      const { genre: g, prompt, focus, variety, blend } = this.params;
       const listener = this.station
         ? this.station.prompts[Math.floor(number / Math.max(1, this.station.segments_per_prompt)) % this.station.prompts.length]
         : prompt;
@@ -181,7 +206,7 @@ export class LiveEngine {
       const seconds = urgent ? Math.min(g.segment_seconds, URGENT_SECONDS) : g.segment_seconds;
       const frames = Math.round(g.overlap_seconds * 50);
       const request = {
-        prompt: fill(g, listener),
+        prompt: fill(g, listener, blend),
         seconds,
         guidance: clamp(g.guidance + focus, 1, 8),
         temperature: clamp(g.temperature + variety, 0.5, 1.6),
@@ -312,7 +337,7 @@ export class LiveEngine {
 
   /** What store.js keeps to resume this session from `segment`. */
   #snapshot(segment) {
-    const { genre, prompt, focus, variety } = this.params;
+    const { genre, prompt, focus, variety, blend } = this.params;
     return {
       audio: segment.buffer.getChannelData(0).slice(),
       sampleRate: segment.buffer.sampleRate,
@@ -322,7 +347,7 @@ export class LiveEngine {
       rejoin: segment.rejoin,
       // The genre and prompt, without this session's speed or a previous "resumed".
       label: segment.label.replace(/ · resumed$/, "").replace(/ · [\d.]+× real time/, ""),
-      params: { genreId: genre.id, prompt, focus, variety },
+      params: { genreId: genre.id, prompt, focus, variety, blendId: blend?.genre.id ?? null, blendShare: blend?.share ?? 0 },
       stationId: this.station?.id ?? null,
       number: this.segmentsMade ?? 0,
       savedAt: Date.now(),
@@ -340,10 +365,15 @@ export class LiveEngine {
   }
 }
 
-/** The genre's template with the listener's words (driftscape_core::preset::Genre::prompt). */
-export function fill(genre, listener) {
+/**
+ * The genre's template with the listener's words (driftscape_core::preset::Genre::prompt), and a second genre's
+ * flavor when the terrain pad sits between two regions.
+ */
+export function fill(genre, listener, blend = null) {
   const words = listener.trim() || genre.default_prompt;
-  return genre.template.replace("{prompt}", words).replace("{bpm}", genre.bpm ? genre.bpm.toFixed(0) : "");
+  const base = genre.template.replace("{prompt}", words).replace("{bpm}", genre.bpm ? genre.bpm.toFixed(0) : "");
+  if (!blend || blend.share < 0.25) return base;
+  return `${base}, ${blend.share > 0.4 ? "blended with" : "with a touch of"} ${blend.genre.flavor}`;
 }
 
 const clamp = (x, lo, hi) => Math.min(Math.max(x, lo), hi);
