@@ -11,12 +11,14 @@ The Phoenix LiveView prototype lives on the `platform` branch.
 ```
 crates/core/   pure audio work: WAV, resampling, tempo, WSOLA time-stretch, seamless loops, tempo-fitted loops
                (fit_loop) and rejoin points, the real-time mixer and
-               leveler, genre/station presets. No I/O, no model code, no threads.
+               leveler, genre/station presets, producer arrangements and their mixdown (arrange.rs).
+               No I/O, no model code, no threads.
 crates/infer/  voices. MusicGen: text encoder + EnCodec on ONNX Runtime (q4 files from Xenova/musicgen-small),
                decoder on candle/Metal (gpu.rs, facebook/musicgen-small safetensors) or ONNX on CPU (onnx.rs)
-crates/cli/    the `driftscape` binary: live, radio, gen, loop, play, info. live.rs runs live and radio mode
+crates/cli/    the `driftscape` binary: live, radio, gen, loop, render, play, info, serve. live.rs runs live and radio mode
                (generator thread, control loop, audio callback, recorder thread).
-crates/wasm/   C ABI over core for the browser (rejoin, tempo); no wasm-bindgen
+crates/wasm/   C ABI over core for the browser (rejoin, tempo, arr_* for the producer mixdown); no wasm-bindgen, no
+               serde_json (the 64 KB budget): the arrangement goes in as arr_track/arr_clip calls
 presets/       genres/*.toml and stations/*.toml, compiled into core (preset.rs lists them)
 web/           SvelteKit app (adapter-static, Svelte 5, #lib/* imports). lib/engine.js ports live.rs to Web Audio;
                lib/voice/ has the in-browser MusicGen worker (onnxruntime-web, WebGPU), the T5 tokenizer, and
@@ -87,14 +89,20 @@ Planned: `crates/plugin` (nih-plug CLAP, wrapped to VST3/AU with clap-wrapper), 
   the audio before the rejoin point). Urgent short segments are only used when the measured speed keeps up (>= 0.9x);
   otherwise segments stay full length (a short one just loops). `localStorage["driftscape-trace"] = 1` logs repeats.
 - Test with sound off: set the Level knob to 0 (settings in IndexedDB) and read the trace; never play audio unannounced.
-- - Never trust "it runs" for audio: check output against the native reference before calling a backend working.
-- - UI (chosen 2026-11-21; see the concept page https://claude.ai/artifact/5FKYXGJzmyuxeDDCmRGKmr): instruments, calm
+- Never trust "it runs" for audio: check output against the native reference before calling a backend working.
+- UI (chosen 2026-11-21; see the concept page https://claude.ai/artifact/5FKYXGJzmyuxeDDCmRGKmr): instruments, calm
   rather than skeuomorphic. Live = Terrain (web/src/lib/ui/Terrain.svelte, logic in terrain.js): genres are hills on a
   contour map, the dot's position gives a genre plus a blended second one (Genre.flavor words). Dragging steers urgently;
   the Drift knob's autopilot steers gently (engine.tweak(..., {urgent: false}) only shapes the next part). Radio =
   Receiver.svelte: a tuning dial over a band; resting on a station for 0.7 s tunes in. One dark theme.
 - Inline `style` attributes are blocked by the CSP: set CSS variables from script (`el.style.setProperty`).
-- - The app picks NativeVoice when `/api/health` answers `{"engine":"driftscape"}`, else WorkerVoice.
+- Producer = Rack.svelte, logic in lib/producer/project.js (pure, tested), mixdown in Rust via lib/producer/mixdown.js
+  (the main thread has its own instance of the core wasm). Takes are in IndexedDB ("takes", schema v2), the project in
+  kv "project". Preview mixes at 32 kHz, export at 48 kHz 24-bit stereo. Extend continues a take's tokens: the new take
+  starts `overlapSeconds` before the old one ends and they crossfade linearly (measured 0.99 correlation there).
+  `Curve::Linear` for aligned material, equal power for unrelated. Grid items need `minmax(0, 1fr)` columns, or the
+  wide timeline stretches the instrument.
+- The app picks NativeVoice when `/api/health` answers `{"engine":"driftscape"}`, else WorkerVoice.
 
 ## Rules
 

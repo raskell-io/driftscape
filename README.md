@@ -10,13 +10,16 @@
 </h1>
 
 <p align="center">
-  <em>Ambient soundscapes: composable, location-aware, generated in your browser.</em>
+  <em>Ambient soundscapes, generated on your own machine.</em>
 </p>
 
-Driftscape is a listening platform for ambient music and soundscapes. Tracks are small and loop
-gaplessly, scenes are layered from loops and field recordings, and a MusicGen model runs on the
-listener's own GPU through WebGPU, so generation costs the server nothing. Later, soundscapes can be
-tied to places and shift as you move. Built with Phoenix.
+Driftscape is a local AI music engine for ambient music and soundscapes. One Rust core, several ways in: a command
+line, a web app (served by the engine on your machine, or as a static site that runs the model in your browser), and
+later a DAW plugin. Three modes:
+
+- **Live**: endless music, made as it plays, steered while it plays.
+- **Radio**: stations, each a preset that keeps the music moving.
+- **Producer**: a rack of layers. Generate takes, extend them, arrange them on a timeline and export a WAV.
 
 ---
 
@@ -33,6 +36,7 @@ driftscape gen "warm ambient pads" --seconds 10 -o pads.wav
 driftscape gen "dub techno, soft kick" --bpm 118 --bars 8 --rate 48000 -o dub.wav   # DAW-ready loop
 driftscape loop pads.wav --bars 4 -o loop.wav         # cut a seamless loop
 driftscape loop dub.wav --bars 4 --to-bpm 124 -o dub-124.wav   # refit to another tempo
+driftscape render piece.json -o piece.wav             # mix a producer arrangement (see `driftscape render --help`)
 ```
 
 Live and radio sessions are recorded to `~/Music/Driftscape` (`--record <path>` or `--no-record`).
