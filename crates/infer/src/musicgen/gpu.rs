@@ -18,10 +18,11 @@
 
 use super::{CODEBOOKS, Decoder, TEXT_DIM, VOCAB};
 use anyhow::{Context, Result, anyhow};
-use candle_core::{DType, Device, Module, Tensor};
-use candle_nn::{
-    Embedding, LayerNorm, Linear, VarBuilder, embedding, kv_cache::KvCache, layer_norm, linear, linear_no_bias,
+use candle_core::{
+    DType, Device, Module, Tensor,
+    quantized::{GgmlDType, QMatMul, QTensor},
 };
+use candle_nn::{Embedding, LayerNorm, Linear, VarBuilder, embedding, kv_cache::KvCache, layer_norm, linear};
 use std::path::Path;
 
 const HIDDEN: usize = 1024;
@@ -54,46 +55,90 @@ fn merge(x: &Tensor) -> Result<Tensor> {
     Ok(x.transpose(1, 2)?.reshape((b, s, HIDDEN))?)
 }
 
-/// Several bias-free projections of the same input as one matrix multiply.
-fn fused(vb: &VarBuilder, names: &[&str], in_dim: usize, out_dim: usize) -> Result<Linear> {
-    let weights = names
-        .iter()
-        .map(|n| vb.get((out_dim, in_dim), &format!("{n}.weight")))
-        .collect::<candle_core::Result<Vec<_>>>()?;
-    Ok(Linear::new(Tensor::cat(&weights, 0)?, None))
+/// Where weights come from: the same checkpoint on the device (for plain layers) and on the CPU in f32 (the source for
+/// quantization, which candle only does on the CPU).
+#[derive(Clone)]
+struct Weights<'a> {
+    device_vb: VarBuilder<'a>,
+    cpu_vb: VarBuilder<'a>,
+    device: Device,
+    quant: Option<GgmlDType>,
+}
+
+impl Weights<'_> {
+    fn pp(&self, prefix: impl ToString) -> Self {
+        let prefix = prefix.to_string();
+        Self {
+            device_vb: self.device_vb.pp(&prefix),
+            cpu_vb: self.cpu_vb.pp(&prefix),
+            device: self.device.clone(),
+            quant: self.quant,
+        }
+    }
+
+    /// One or several bias-free projections of the same input, as one matrix multiply.
+    fn proj(&self, names: &[&str], in_dim: usize, out_dim: usize) -> Result<Proj> {
+        let shape = (out_dim, in_dim);
+        let get = |vb: &VarBuilder| -> candle_core::Result<Tensor> {
+            let parts =
+                names.iter().map(|n| vb.get(shape, &format!("{n}.weight"))).collect::<candle_core::Result<Vec<_>>>()?;
+            Tensor::cat(&parts, 0)
+        };
+        Ok(match self.quant {
+            Some(q) => {
+                Proj::Quantized(QMatMul::from_qtensor(QTensor::quantize_onto(&get(&self.cpu_vb)?, q, &self.device)?)?)
+            }
+            None => Proj::Plain(Linear::new(get(&self.device_vb)?, None)),
+        })
+    }
+}
+
+/// A bias-free linear layer, plain or with quantized weights (llama.cpp-style kernels, fast for few rows).
+enum Proj {
+    Plain(Linear),
+    Quantized(QMatMul),
+}
+
+impl Module for Proj {
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        match self {
+            Self::Plain(l) => l.forward(x),
+            Self::Quantized(q) => q.forward(x),
+        }
+    }
 }
 
 struct Layer {
     self_norm: LayerNorm,
-    self_qkv: Linear,
-    self_out: Linear,
+    self_qkv: Proj,
+    self_out: Proj,
     cross_norm: LayerNorm,
-    cross_q: Linear,
-    cross_kv: Linear,
-    cross_out: Linear,
+    cross_q: Proj,
+    cross_kv: Proj,
+    cross_out: Proj,
     ffn_norm: LayerNorm,
-    fc1: Linear,
-    fc2: Linear,
+    fc1: Proj,
+    fc2: Proj,
     cache: KvCache,
     /// Cross-attention keys and values, computed once per sequence from the text.
     cross: Option<(Tensor, Tensor)>,
 }
 
 impl Layer {
-    fn load(vb: VarBuilder, max_len: usize) -> Result<Self> {
-        let sa = vb.pp("self_attn");
-        let ca = vb.pp("encoder_attn");
+    fn load(w: Weights, max_len: usize) -> Result<Self> {
+        let (sa, ca) = (w.pp("self_attn"), w.pp("encoder_attn"));
+        let vb = &w.device_vb;
         Ok(Self {
             self_norm: layer_norm(HIDDEN, EPS, vb.pp("self_attn_layer_norm"))?,
-            self_qkv: fused(&sa, &["q_proj", "k_proj", "v_proj"], HIDDEN, HIDDEN)?,
-            self_out: linear_no_bias(HIDDEN, HIDDEN, sa.pp("out_proj"))?,
+            self_qkv: sa.proj(&["q_proj", "k_proj", "v_proj"], HIDDEN, HIDDEN)?,
+            self_out: sa.proj(&["out_proj"], HIDDEN, HIDDEN)?,
             cross_norm: layer_norm(HIDDEN, EPS, vb.pp("encoder_attn_layer_norm"))?,
-            cross_q: linear_no_bias(HIDDEN, HIDDEN, ca.pp("q_proj"))?,
-            cross_kv: fused(&ca, &["k_proj", "v_proj"], HIDDEN, HIDDEN)?,
-            cross_out: linear_no_bias(HIDDEN, HIDDEN, ca.pp("out_proj"))?,
+            cross_q: ca.proj(&["q_proj"], HIDDEN, HIDDEN)?,
+            cross_kv: ca.proj(&["k_proj", "v_proj"], HIDDEN, HIDDEN)?,
+            cross_out: ca.proj(&["out_proj"], HIDDEN, HIDDEN)?,
             ffn_norm: layer_norm(HIDDEN, EPS, vb.pp("final_layer_norm"))?,
-            fc1: linear_no_bias(HIDDEN, FFN, vb.pp("fc1"))?,
-            fc2: linear_no_bias(FFN, HIDDEN, vb.pp("fc2"))?,
+            fc1: w.proj(&["fc1"], HIDDEN, FFN)?,
+            fc2: w.proj(&["fc2"], FFN, HIDDEN)?,
             cache: KvCache::new(2, max_len),
             cross: None,
         })
@@ -135,7 +180,7 @@ pub struct GpuDecoder {
     layers: Vec<Layer>,
     norm: LayerNorm,
     /// The four codebook heads stacked: `[CODEBOOKS * VOCAB, HIDDEN]`.
-    heads: Linear,
+    heads: Proj,
     enc_to_dec: Linear,
     position: usize,
 }
@@ -156,21 +201,35 @@ fn sinusoids(positions: usize, dim: usize, device: &Device) -> Result<Tensor> {
 }
 
 impl GpuDecoder {
-    /// Load the decoder. `DRIFTSCAPE_DTYPE=f16` (or `bf16`) runs it at half precision.
+    /// Load the decoder. Matrix weights are quantized to 8 bits by default (`DRIFTSCAPE_QUANT=q8_0`); `q4k` quantizes
+    /// further, `none` keeps them plain, in which case `DRIFTSCAPE_DTYPE=f16` (or `bf16`) runs at half precision.
     pub fn load(weights: &Path) -> Result<Self> {
         if !weights.exists() {
             anyhow::bail!("GPU decoder needs {}; download it from facebook/musicgen-small", weights.display());
         }
         let device = Device::metal_if_available(0)?;
-        let dtype = match std::env::var("DRIFTSCAPE_DTYPE").as_deref() {
-            Ok("f16") => DType::F16,
-            Ok("bf16") => DType::BF16,
+        let quant = match std::env::var("DRIFTSCAPE_QUANT").as_deref() {
+            Ok("none") => None,
+            Ok("q4k") => Some(GgmlDType::Q4K),
+            _ => Some(GgmlDType::Q8_0),
+        };
+        // Quantized kernels take f32 activations.
+        let dtype = match (quant, std::env::var("DRIFTSCAPE_DTYPE").as_deref()) {
+            (None, Ok("f16")) => DType::F16,
+            (None, Ok("bf16")) => DType::BF16,
             _ => DType::F32,
         };
         // SAFETY: the file is memory-mapped read-only and not modified while the decoder lives.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], dtype, &device) }
-            .with_context(|| format!("loading {}", weights.display()))?;
+        let map = |dtype, device: &Device| unsafe { VarBuilder::from_mmaped_safetensors(&[weights], dtype, device) };
+        let w = Weights {
+            device_vb: map(dtype, &device).with_context(|| format!("loading {}", weights.display()))?,
+            cpu_vb: map(DType::F32, &Device::Cpu)?,
+            device: device.clone(),
+            quant,
+        };
+        let vb = w.device_vb.clone();
         let dec = vb.pp("decoder.model.decoder");
+        let dec_w = w.pp("decoder.model.decoder");
         let head_names: Vec<String> = (0..CODEBOOKS).map(|k| format!("lm_heads.{k}")).collect();
         let head_names: Vec<&str> = head_names.iter().map(String::as_str).collect();
         Ok(Self {
@@ -179,10 +238,10 @@ impl GpuDecoder {
                 .collect::<candle_core::Result<_>>()?,
             positions: dec.get((MAX_POSITIONS, HIDDEN), "embed_positions.weights")?,
             layers: (0..LAYERS)
-                .map(|l| Layer::load(dec.pp(format!("layers.{l}")), MAX_POSITIONS))
+                .map(|l| Layer::load(dec_w.pp(format!("layers.{l}")), MAX_POSITIONS))
                 .collect::<Result<_>>()?,
             norm: layer_norm(HIDDEN, EPS, dec.pp("layer_norm"))?,
-            heads: fused(&vb.pp("decoder"), &head_names, HIDDEN, VOCAB)?,
+            heads: w.pp("decoder").proj(&head_names, HIDDEN, VOCAB)?,
             enc_to_dec: linear(TEXT_DIM, HIDDEN, vb.pp("enc_to_dec_proj"))?,
             position: 0,
             device,

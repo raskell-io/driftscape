@@ -1,4 +1,7 @@
 //! Print the inputs and outputs of every ONNX file in a model directory.
+
+// Links the clang runtime that ONNX Runtime needs (see crates/infer/build.rs).
+use driftscape_infer as _;
 fn main() -> ort::Result<()> {
     let env = ort::environment::init().with_telemetry(false).build()?;
     let dir = std::env::args().nth(1).expect("model directory");
