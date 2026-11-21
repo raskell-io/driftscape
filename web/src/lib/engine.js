@@ -7,9 +7,12 @@
 // and asks for a short urgent segment from what is playing now, which comes in as soon as it's ready.
 //
 // Events (onEvent): { type: "segment", label } · { type: "repeat" } · { type: "progress", fraction } ·
-//                   { type: "state", playing } · { type: "error", message }
+//                   { type: "state", playing } · { type: "error", message } ·
+//                   { type: "snapshot", snapshot } when a new segment starts (see store.js; the page saves it so the
+//                   session can resume later)
 
 import { CancelledError } from "./voice/voice.js";
+import { appendRecording, finishRecording, startRecording } from "./store.js";
 
 const URGENT_SECONDS = 6;
 const CHANGE_FADE = 3;
@@ -44,11 +47,14 @@ export class LiveEngine {
     this.playingTokens = null;
     this.playing = null; // { segment, buffer, start, offset, gain, source }
     this.abort = null;
-    this.recording = null; // Int16 chunks while recording
+    this.recording = null; // { id, pending: Int16Array[], pendingFrames, frames } while recording
   }
 
-  /** Start a session. Must be called from a user gesture (it creates the AudioContext). */
-  async start({ genre, prompt = "", station = null }) {
+  /**
+   * Start a session. Must be called from a user gesture (it creates the AudioContext). With `resume` (a snapshot from
+   * store.js) the snapshot's segment plays at once and generation continues from its tokens.
+   */
+  async start({ genre, prompt = "", station = null, focus = 0, variety = 0, resume = null }) {
     if (this.running) this.stop();
     this.ctx ??= new AudioContext({ latencyHint: "playback" });
     await this.ctx.resume();
@@ -59,14 +65,22 @@ export class LiveEngine {
       this.bus = new GainNode(this.ctx);
       this.bus.connect(this.output).connect(this.ctx.destination);
     }
-    this.params = { genre, prompt, focus: 0, variety: 0 };
+    this.params = { genre, prompt, focus, variety };
     this.station = station;
     this.version++;
     this.ready = null;
     this.playingTokens = null;
     this.running = true;
+    let start = { previous: null, number: 0 };
+    if (resume) {
+      const buffer = new AudioBuffer({ length: resume.audio.length, sampleRate: resume.sampleRate, numberOfChannels: 1 });
+      buffer.copyToChannel(resume.audio, 0);
+      this.ready = { ...resume, buffer, urgent: false, speed: null, label: `${resume.label} · resumed` };
+      start = { previous: resume.codebooks, number: resume.number };
+    }
+    this.segmentsMade = start.number;
     this.onEvent({ type: "state", playing: true });
-    this.#generateLoop().catch((e) => this.#fail(e));
+    this.#generateLoop(start).catch((e) => this.#fail(e));
     this.timer = setInterval(() => this.#tick(), TICK_MS);
   }
 
@@ -100,46 +114,70 @@ export class LiveEngine {
   }
 
   // ---- recording ---------------------------------------------------------------------------------------------------
+  // Recordings go to IndexedDB in chunks of a couple of seconds as they are made (store.js), so a reload or a crash
+  // loses at most the last chunk.
 
-  startRecording() {
-    this.recording = [];
+  async startRecording(label) {
+    const sampleRate = this.ctx?.sampleRate ?? 48000;
+    const id = await startRecording({ sampleRate, label });
+    this.recording = { id, pending: [], pendingFrames: 0, frames: 0, sampleRate };
     this.output?.port.postMessage({ type: "record", on: true });
+    return id;
   }
 
-  /** Stop recording and return it as a WAV Blob (mono, 16-bit, at the context's rate), or null. */
-  stopRecording() {
+  /** Stop recording; resolves with the recording's id once everything is stored. */
+  async stopRecording() {
     this.output?.port.postMessage({ type: "record", on: false });
-    const chunks = this.recording;
+    const rec = this.recording;
     this.recording = null;
-    if (!chunks?.length) return null;
-    return wav(chunks, this.ctx.sampleRate);
+    if (!rec) return null;
+    await this.#flush(rec);
+    await finishRecording(rec.id);
+    return rec.id;
   }
 
   recordedSeconds() {
-    return this.recording ? this.recording.reduce((n, c) => n + c.length, 0) / this.ctx.sampleRate : 0;
+    return this.recording ? this.recording.frames / this.recording.sampleRate : 0;
   }
 
   #capture(samples) {
-    if (!this.recording) return;
+    const rec = this.recording;
+    if (!rec) return;
     const pcm = new Int16Array(samples.length);
     for (let i = 0; i < samples.length; i++) pcm[i] = Math.max(-1, Math.min(1, samples[i])) * 32767;
-    this.recording.push(pcm);
+    rec.pending.push(pcm);
+    rec.pendingFrames += pcm.length;
+    rec.frames += pcm.length;
+    if (rec.pendingFrames >= rec.sampleRate * 2) this.#flush(rec);
+  }
+
+  #flush(rec) {
+    if (!rec.pendingFrames) return Promise.resolve();
+    const chunk = new Int16Array(rec.pendingFrames);
+    let at = 0;
+    for (const p of rec.pending) {
+      chunk.set(p, at);
+      at += p.length;
+    }
+    rec.pending = [];
+    rec.pendingFrames = 0;
+    // Chunks are written in order: IndexedDB transactions on the same stores run in the order they were created.
+    return appendRecording(rec.id, chunk).catch((e) => this.onEvent({ type: "error", message: `saving the recording: ${e.message}` }));
   }
 
   // ---- generation --------------------------------------------------------------------------------------------------
 
-  async #generateLoop() {
-    let previous = null; // codebooks of the segment the next one continues
+  async #generateLoop({ previous, number }) {
+    // previous: codebooks of the segment the next one continues; number: segments made so far.
     let placedVersion = this.version;
     let gain = null;
-    let number = 0;
     while (this.running) {
       const v = this.version;
       const { genre: g, prompt, focus, variety } = this.params;
       const listener = this.station
         ? this.station.prompts[Math.floor(number / Math.max(1, this.station.segments_per_prompt)) % this.station.prompts.length]
         : prompt;
-      const urgent = v !== placedVersion || number === 0;
+      const urgent = v !== placedVersion || (number === 0 && !this.ready);
       const seconds = urgent ? Math.min(g.segment_seconds, URGENT_SECONDS) : g.segment_seconds;
       const frames = Math.round(g.overlap_seconds * 50);
       const request = {
@@ -190,6 +228,7 @@ export class LiveEngine {
         crossfade: Math.min(g.crossfade_seconds, Math.max(result.overlapSeconds, 1)),
         rejoin: result.rejoin / result.sampleRate,
         urgent,
+        speed: seconds / result.seconds, // seconds of new audio per second of generation
         label: [
           g.name,
           listener.trim() || g.default_prompt,
@@ -211,6 +250,7 @@ export class LiveEngine {
       previous = segment.codebooks;
       placedVersion = v;
       number++;
+      this.segmentsMade = number;
     }
   }
 
@@ -264,7 +304,29 @@ export class LiveEngine {
     this.voices = [...(this.voices ?? []).filter((v) => !v.done), voice];
     source.onended = () => (voice.done = true);
     this.playing = voice;
-    if (!repeat) this.onEvent({ type: "segment", label: segment.label });
+    if (!repeat) {
+      this.onEvent({ type: "segment", label: segment.label, speed: segment.speed });
+      this.onEvent({ type: "snapshot", snapshot: this.#snapshot(segment) });
+    }
+  }
+
+  /** What store.js keeps to resume this session from `segment`. */
+  #snapshot(segment) {
+    const { genre, prompt, focus, variety } = this.params;
+    return {
+      audio: segment.buffer.getChannelData(0).slice(),
+      sampleRate: segment.buffer.sampleRate,
+      codebooks: segment.codebooks,
+      overlap: segment.overlap,
+      crossfade: segment.crossfade,
+      rejoin: segment.rejoin,
+      // The genre and prompt, without this session's speed or a previous "resumed".
+      label: segment.label.replace(/ · resumed$/, "").replace(/ · [\d.]+× real time/, ""),
+      params: { genreId: genre.id, prompt, focus, variety },
+      stationId: this.station?.id ?? null,
+      number: this.segmentsMade ?? 0,
+      savedAt: Date.now(),
+    };
   }
 
   #fadeOut(voice, at, fade) {
@@ -286,23 +348,3 @@ export function fill(genre, listener) {
 
 const clamp = (x, lo, hi) => Math.min(Math.max(x, lo), hi);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-/** Mono 16-bit WAV from Int16 chunks. */
-function wav(chunks, sampleRate) {
-  const frames = chunks.reduce((n, c) => n + c.length, 0);
-  const header = new DataView(new ArrayBuffer(44));
-  const text = (at, s) => [...s].forEach((ch, i) => header.setUint8(at + i, ch.charCodeAt(0)));
-  text(0, "RIFF");
-  header.setUint32(4, 36 + frames * 2, true);
-  text(8, "WAVEfmt ");
-  header.setUint32(16, 16, true);
-  header.setUint16(20, 1, true);
-  header.setUint16(22, 1, true);
-  header.setUint32(24, sampleRate, true);
-  header.setUint32(28, sampleRate * 2, true);
-  header.setUint16(32, 2, true);
-  header.setUint16(34, 16, true);
-  text(36, "data");
-  header.setUint32(40, frames * 2, true);
-  return new Blob([header, ...chunks], { type: "audio/wav" });
-}

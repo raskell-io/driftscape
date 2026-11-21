@@ -1,6 +1,14 @@
 /// <reference types="@sveltejs/kit" />
-// Offline support with SvelteKit's service worker. The app's own files are cached per deploy; the model (about
-// 570 MB) is cached separately by the voice worker, in its own Cache Storage bucket, and is never touched here.
+// Offline support and safe updates.
+//
+// - The app's own files (the hashed build, static/ including the ONNX runtime and core wasm, and the pages) are cached
+//   per deploy, under a cache named after the deploy's version, and served cache-first. With the model in Cache
+//   Storage too (the voice worker's "driftscape-models-v1", never touched here), Driftscape works fully offline.
+// - A new deploy installs in the background but does not take over a page that is playing: it waits until the page
+//   asks for it ("skip-waiting", sent when the listener chooses to reload) or until every tab is closed. Only then are
+//   older caches removed, so a running session never loses a file it still needs.
+// - Pages are network-first with the cached copy as the offline fallback; /api/ (the native engine behind
+//   `driftscape serve`) is never cached.
 import { assets, immutable, prerendered } from "$app/manifest";
 import { version } from "$app/env";
 
@@ -8,7 +16,11 @@ const CACHE = `app-${version}`;
 const ASSETS = new Set([...immutable, ...assets, ...prerendered].map(({ path }) => (path.startsWith("/") ? path : "/" + path)));
 
 self.addEventListener("install", (event) => {
-  event.waitUntil(caches.open(CACHE).then((c) => c.addAll([...ASSETS])).then(() => self.skipWaiting()));
+  event.waitUntil(caches.open(CACHE).then((c) => c.addAll([...ASSETS])));
+});
+
+self.addEventListener("message", (event) => {
+  if (event.data?.type === "skip-waiting") self.skipWaiting();
 });
 
 self.addEventListener("activate", (event) => {
@@ -32,7 +44,7 @@ self.addEventListener("fetch", (event) => {
       const cache = await caches.open(CACHE);
       try {
         const res = await fetch(event.request);
-        if (res.ok) cache.put(event.request, res.clone());
+        if (res.ok && event.request.mode === "navigate") cache.put(event.request, res.clone());
         return res;
       } catch {
         return (await cache.match(event.request)) || (await cache.match("/")) || Response.error();

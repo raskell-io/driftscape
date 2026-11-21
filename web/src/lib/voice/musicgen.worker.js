@@ -143,6 +143,13 @@ async function load() {
     await ort.InferenceSession.create(files.codec, options),
   ]);
   model = { tokenizer, text, decoder, codec, core };
+
+  // Warm up: the first run on WebGPU compiles the GPU programs, which can take a long time. Do it now, during loading,
+  // so pressing play doesn't pay for it: a fresh clip, then a continuation of it (the batched replay uses other shapes).
+  post({ type: "loading", detail: "Warming up the engine", fraction: 1 });
+  const warm = { prompt: "ambient pads", seconds: 0.4, guidance: 3, temperature: 1, topK: 50, seed: 1, continueFrom: null };
+  const first = await step("warming up", () => generate(-1, warm));
+  await step("warming up", () => generate(-1, { ...warm, continueFrom: first.codebooks.map((c) => c.slice(-10)) }));
 }
 
 // ---- generation ----------------------------------------------------------------------------------------------------

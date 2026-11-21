@@ -64,7 +64,14 @@ Planned: `crates/plugin` (nih-plug CLAP, wrapped to VST3/AU with clap-wrapper), 
 - Hosting: Cloudflare Pages project `driftscape-raskell-io` (direct upload; the build needs Rust and Node, so it is not
   Git-connected). `mise run deploy` builds and uploads. Domain: driftscape.raskell.io.
 - App icons are rendered from static/icon.svg with headless Chrome (ImageMagick renders this SVG extremely slowly).
-- The app picks NativeVoice when `/api/health` answers `{"engine":"driftscape"}`, else WorkerVoice.
+- Persistence (web/src/lib/store.js, IndexedDB): settings; a snapshot of the playing segment (audio + tokens) so
+  "Continue where you left off" plays at once and generates on from its tokens; recordings written in 2 s chunks, so a
+  reload or crash keeps them (listed as interrupted). The model is in Cache Storage (`driftscape-models-v1`); the page
+  calls `navigator.storage.persist()` after loading.
+- Service worker: a new deploy waits; the page shows "A new version is ready · Reload" and only then sends
+  `skip-waiting`. Never reload on `controllerchange` unless the listener asked (a first install also fires it).
+- The voice worker warms up WebGPU after loading (two tiny generations) so the first play doesn't compile shaders.
+- - The app picks NativeVoice when `/api/health` answers `{"engine":"driftscape"}`, else WorkerVoice.
 
 ## Rules
 

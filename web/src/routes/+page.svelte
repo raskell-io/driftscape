@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { chooseVoice } from "#lib/voice/voice.js";
   import { LiveEngine } from "#lib/engine.js";
+  import * as store from "#lib/store.js";
 
   let presets = $state({ genres: [], stations: [] });
   let mode = $state("live"); // "live" | "radio"
@@ -10,16 +11,27 @@
   let focus = $state(0); // -2..2 steps of 0.5 guidance
   let wander = $state(0); // -2..2 steps of 0.1 temperature
   let stationId = $state(null);
+  let settingsLoaded = $state(false);
 
   let engineState = $state({ phase: "starting", detail: "Looking for an engine", fraction: 0 });
   let voiceLabel = $state("");
+  let native = $state(false);
   let playing = $state(false);
   let nowPlaying = $state("");
   let progress = $state(0);
+  let startedAt = $state(0);
+  let now = $state(Date.now());
+  let slow = $state(false);
   let log = $state([]);
   let error = $state("");
   let recording = $state(false);
   let recordedSeconds = $state(0);
+
+  let resumable = $state(null); // a saved session snapshot
+  let recordings = $state([]);
+  let storageInfo = $state(null);
+  let updateReady = $state(null); // a waiting service worker
+  let online = $state(true);
 
   let engine = null;
   let recordTimer = null;
@@ -27,23 +39,80 @@
   const genre = $derived(presets.genres.find((g) => g.id === genreId));
   const station = $derived(presets.stations.find((s) => s.id === stationId));
   const engineReady = $derived(engineState.phase === "ready");
+  const waitingSeconds = $derived(startedAt && !nowPlaying ? Math.max(0, (now - startedAt) / 1000) : 0);
 
   onMount(async () => {
-    presets = await (await fetch("/presets.json")).json();
+    online = navigator.onLine;
+    addEventListener("online", () => (online = true));
+    addEventListener("offline", () => (online = false));
+    setInterval(() => (now = Date.now()), 1000);
+    watchForUpdates();
+
+    const [loadedPresets, settings, session] = await Promise.all([
+      fetch("/presets.json").then((r) => r.json()),
+      store.loadSettings(),
+      store.loadSession(),
+    ]);
+    presets = loadedPresets;
+    if (settings) ({ mode = "live", genreId = "ambient", prompt = "", focus = 0, wander = 0 } = settings);
+    settingsLoaded = true;
+    if (session?.audio) resumable = session;
+    refreshLibrary();
+
     const voice = await chooseVoice(({ detail, fraction }) => (engineState = { phase: "loading", detail, fraction }));
     voiceLabel = voice.label;
+    native = voice.label.includes("engine");
     engine = new LiveEngine(voice, onEvent);
     try {
       await voice.ready();
       engineState = { phase: "ready", detail: "Ready", fraction: 1 };
+      // Keep the 570 MB model: ask the browser not to evict our storage.
+      if (!native) await store.persist();
     } catch (e) {
       engineState = { phase: "failed", detail: e.message, fraction: 0 };
     }
+    refreshLibrary();
   });
+
+  // Remember settings for the next visit.
+  $effect(() => {
+    const settings = { mode, genreId, prompt, focus, wander };
+    if (settingsLoaded) store.saveSettings(settings);
+  });
+
+  async function refreshLibrary() {
+    recordings = await store.listRecordings().catch(() => []);
+    storageInfo = await store.storage().catch(() => null);
+  }
+
+  /** A new deploy waits (see service-worker.js); offer it instead of switching under a playing session. */
+  async function watchForUpdates() {
+    const reg = await navigator.serviceWorker?.getRegistration();
+    if (!reg) return;
+    const offer = (worker) => {
+      if (worker && navigator.serviceWorker.controller) updateReady = worker;
+    };
+    offer(reg.waiting);
+    reg.addEventListener("updatefound", () => {
+      const w = reg.installing;
+      w?.addEventListener("statechange", () => w.state === "installed" && offer(w));
+    });
+    // Reload only for an update the listener asked for; on a first visit the new worker also takes control, and that
+    // must not reload a page that may already be playing.
+    navigator.serviceWorker.addEventListener("controllerchange", () => updateRequested && location.reload());
+    setInterval(() => reg.update().catch(() => {}), 30 * 60 * 1000);
+  }
+  let updateRequested = false;
+  function applyUpdate() {
+    updateRequested = true;
+    updateReady?.postMessage({ type: "skip-waiting" });
+  }
 
   function onEvent(e) {
     if (e.type === "segment") {
       nowPlaying = e.label;
+      // Below about 0.3× real time live mode mostly repeats; say why and what helps.
+      if (e.speed != null) slow = !native && e.speed < 0.3;
       log = [{ kind: "segment", text: e.label }, ...log].slice(0, 6);
     } else if (e.type === "repeat") {
       // One line for a run of repeats, with a count.
@@ -55,30 +124,59 @@
     } else if (e.type === "state") {
       playing = e.playing;
       if (!e.playing) nowPlaying = "";
+    } else if (e.type === "snapshot") {
+      store.saveSession(e.snapshot);
     } else if (e.type === "error") {
       error = e.message;
     }
   }
 
-  async function playLive() {
+  function begin() {
     error = "";
-    stationId = null;
     log = [];
-    await engine.start({ genre, prompt });
+    nowPlaying = "";
+    progress = 0;
+    startedAt = Date.now();
+    resumable = null;
+  }
+
+  async function playLive() {
+    begin();
+    stationId = null;
+    await engine.start({ genre, prompt, focus: focus * 0.5, variety: wander * 0.1 });
   }
 
   async function tune(id) {
-    error = "";
     if (stationId === id && playing) return stop();
+    begin();
     stationId = id;
     const s = presets.stations.find((x) => x.id === id);
-    log = [];
     await engine.start({ genre: presets.genres.find((g) => g.id === s.genre), station: s });
+  }
+
+  async function resume() {
+    const snap = resumable;
+    const s = presets.stations.find((x) => x.id === snap.stationId) ?? null;
+    const g = presets.genres.find((x) => x.id === snap.params.genreId) ?? genre;
+    begin();
+    stationId = s?.id ?? null;
+    mode = s ? "radio" : "live";
+    if (!s) {
+      genreId = g.id;
+      prompt = snap.params.prompt;
+    }
+    await engine.start({ genre: g, prompt: snap.params.prompt, station: s, focus: snap.params.focus, variety: snap.params.variety, resume: snap });
+  }
+
+  function dismissResume() {
+    resumable = null;
+    store.clearSession();
   }
 
   function stop() {
     engine?.stop();
     stationId = null;
+    startedAt = 0;
   }
 
   // Steering while it plays (live mode only).
@@ -95,27 +193,51 @@
     else if (engineReady) playLive();
   }
 
-  function toggleRecording() {
+  async function toggleRecording() {
     if (!recording) {
-      engine.startRecording();
       recording = true;
+      await engine.startRecording(station?.name ?? `${genre?.name ?? "Live"} · ${prompt.trim() || genre?.default_prompt || ""}`);
       recordTimer = setInterval(() => (recordedSeconds = engine.recordedSeconds()), 500);
+      refreshLibrary();
       return;
     }
     clearInterval(recordTimer);
     recording = false;
-    const blob = engine.stopRecording();
     recordedSeconds = 0;
-    if (!blob) return;
+    await engine.stopRecording();
+    refreshLibrary();
+  }
+
+  async function saveRecording(rec) {
+    const blob = await store.recordingWav(rec.id);
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    const stamp = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "");
-    a.download = `driftscape-${stationId ?? genreId}-${stamp}.wav`;
+    const stamp = new Date(rec.startedAt).toISOString().slice(0, 16).replace(/[-:T]/g, "");
+    a.download = `driftscape-${stamp}.wav`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
   }
 
+  async function deleteRecording(rec) {
+    await store.deleteRecording(rec.id);
+    refreshLibrary();
+  }
+
+  async function removeModel() {
+    await store.removeModel();
+    refreshLibrary();
+  }
+
   const clock = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+  const mb = (bytes) => `${Math.round(bytes / 1e6)} MB`;
+  function ago(ms) {
+    const m = Math.round((Date.now() - ms) / 60000);
+    if (m < 1) return "just now";
+    if (m < 60) return `${m} min ago`;
+    const h = Math.round(m / 60);
+    return h < 24 ? `${h} h ago` : new Date(ms).toLocaleDateString();
+  }
+  const when = (ms) => new Date(ms).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
 </script>
 
 <div class="band" aria-hidden="true"></div>
@@ -148,6 +270,34 @@
 {#if engineState.phase === "loading"}
   <div class="loadbar" aria-hidden="true"><span style:--f={engineState.fraction}></span></div>
   <p class="hint">The first visit downloads the model once (about 570 MB). After that it starts in seconds, even offline.</p>
+{/if}
+
+{#if updateReady}
+  <div class="banner" role="status">
+    <span>A new version of Driftscape is ready.</span>
+    <button class="secondary small" onclick={applyUpdate}>{playing ? "Reload (stops the music)" : "Reload"}</button>
+  </div>
+{/if}
+
+{#if !online}
+  <div class="banner quiet" role="status">
+    {#if storageInfo?.modelCached || native}You're offline. Everything still works: the music is made on this device.
+    {:else}You're offline, and the model isn't downloaded yet. Connect once to fetch it; after that Driftscape works offline.{/if}
+  </div>
+{/if}
+
+{#if resumable && !playing}
+  <section class="resume" aria-label="Continue where you left off">
+    <div>
+      <span class="label">Continue where you left off</span>
+      <p class="resume-text">{resumable.label}</p>
+      <p class="resume-when">{ago(resumable.savedAt)} · starts at once and carries on from there</p>
+    </div>
+    <div class="resume-actions">
+      <button class="play small" onclick={resume} disabled={!engineReady} aria-label="Continue">▶</button>
+      <button class="link" onclick={dismissResume}>Dismiss</button>
+    </div>
+  </section>
 {/if}
 
 <nav class="modes" aria-label="Mode">
@@ -214,7 +364,7 @@
       {/if}
       <p class="transport-hint">
         {#if playing && !stationId}Type a new prompt or pick a genre to steer; you'll hear it within seconds.
-        {:else if engineReady}Press play. The first part takes a few seconds to make.
+        {:else if engineReady}Press play. {native ? "The first part takes a few seconds to make." : "In the browser the first part takes 10–20 seconds to make."}
         {:else}Waiting for the engine.{/if}
       </p>
     </div>
@@ -240,13 +390,18 @@
     <div class="now-head">
       <span class="label">Now playing</span>
       <button class="record" class:on={recording} onclick={toggleRecording}>
-        {recording ? `● Save recording · ${clock(recordedSeconds)}` : "● Record"}
+        {recording ? `● Stop recording · ${clock(recordedSeconds)}` : "● Record"}
       </button>
     </div>
     <p class="nowtext">
-      {#if playing}{nowPlaying || (station ? `Tuning in to ${station.name}…` : "Making the first part…")}
-      {:else}Stopped. Save the recording, or press play to keep recording.{/if}
+      {#if playing}{nowPlaying ||
+          `${station ? `Tuning in to ${station.name}` : "Making the first part"}… ${Math.round(progress * 100)} % · ${Math.floor(waitingSeconds)} s`}
+      {:else}Stopped. Stop the recording to keep it, or press play to record more.{/if}
     </p>
+    {#if slow}
+      <p class="hint">This browser makes music slower than it plays, so parts repeat while the next is made. For smooth,
+        endless play, install the command-line app and run <code>driftscape serve</code>, which uses your GPU directly.</p>
+    {/if}
     <div class="genbar" aria-hidden="true"><span style:--f={progress}></span></div>
     <ol class="log">
       {#each log as entry, i (i)}
@@ -258,9 +413,38 @@
 
 {#if error}<p class="error" role="alert">{error}</p>{/if}
 
+{#if recordings.length}
+  <section class="library" aria-labelledby="rec-title">
+    <h2 id="rec-title" class="label">Your recordings</h2>
+    <p class="hint">Kept in this browser until you delete them. They survive reloads and crashes.</p>
+    <ul>
+      {#each recordings as rec (rec.id)}
+        <li>
+          <div class="rec-info">
+            <span class="rec-label">{rec.label}</span>
+            <span class="rec-meta">{when(rec.startedAt)} · {clock(rec.frames / rec.sampleRate)}{rec.done ? "" : recording ? " · recording" : " · interrupted"}</span>
+          </div>
+          <div class="rec-actions">
+            <button class="secondary small" onclick={() => saveRecording(rec)} disabled={!rec.frames}>Save WAV</button>
+            <button class="link" onclick={() => deleteRecording(rec)} disabled={recording && !rec.done}>Delete</button>
+          </div>
+        </li>
+      {/each}
+    </ul>
+  </section>
+{/if}
+
 <footer>
   {#if voiceLabel}<p>Music is generated by MusicGen small, running on {voiceLabel}. Nothing leaves your device.</p>{/if}
   <p>MusicGen's weights are licensed CC-BY-NC 4.0: free for personal, non-commercial use.</p>
+  {#if storageInfo && !native}
+    <p>
+      {storageInfo.modelCached ? "The model is saved on this device" : "The model isn't downloaded yet"}{storageInfo.persisted
+        ? " and kept"
+        : ""} · {mb(storageInfo.used)} used{#if storageInfo.modelCached && !playing}
+        · <button class="link" onclick={removeModel}>Remove the model</button>{/if}
+    </p>
+  {/if}
 </footer>
 
 <style>
@@ -341,6 +525,29 @@
   .log li.repeat { color: var(--violet); }
 
   .error { color: var(--rose); margin-top: 1rem; }
+  .banner { display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex-wrap: wrap; margin: 0.75rem 0;
+    padding: 0.7rem 1rem; border-radius: 12px; background: var(--raised); border: 1px solid var(--accent); font-size: 0.92rem; }
+  .banner.quiet { border-color: var(--line); color: var(--muted); }
+  .small { padding: 0.35rem 0.8rem; font-size: 0.85rem; border-radius: 999px; }
+  .link { background: none; border: 0; padding: 0; color: var(--muted); text-decoration: underline; cursor: pointer; font-size: 0.85rem; }
+  .link:disabled { opacity: 0.4; cursor: default; }
+  .resume { display: flex; justify-content: space-between; align-items: center; gap: 1rem; margin: 1rem 0 0.5rem; padding: 1rem 1.1rem;
+    background: var(--surface); border: 1px solid var(--line); border-radius: 14px; }
+  .resume .label { margin: 0; }
+  .resume-text { margin: 0.25rem 0 0; font: 600 1rem/1.4 var(--display); }
+  .resume-when { margin: 0.15rem 0 0; color: var(--muted); font-size: 0.85rem; }
+  .resume-actions { display: flex; align-items: center; gap: 0.75rem; flex: none; }
+  .play.small { width: 44px; height: 44px; font-size: 1rem; padding: 0; }
+  .library { margin-top: 2rem; }
+  .library h2 { margin: 0; }
+  .library ul { list-style: none; margin: 0.5rem 0 0; padding: 0; display: flex; flex-direction: column; gap: 0.4rem; }
+  .library li { display: flex; justify-content: space-between; align-items: center; gap: 1rem; padding: 0.7rem 0.9rem;
+    background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
+  .rec-info { display: flex; flex-direction: column; min-width: 0; }
+  .rec-label { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rec-meta { color: var(--muted); font: 12px/1.5 var(--mono); }
+  .rec-actions { display: flex; align-items: center; gap: 0.75rem; flex: none; }
+  code { font: 0.9em var(--mono); background: var(--raised); padding: 0.1em 0.35em; border-radius: 4px; }
   footer { margin-top: 3rem; color: var(--muted); font-size: 0.82rem; border-top: 1px solid var(--line); padding-top: 1rem; }
   footer p { margin: 0.25rem 0; }
   .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
