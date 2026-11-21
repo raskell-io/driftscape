@@ -8,8 +8,11 @@
 use crate::recorder::WavRecorder;
 use anyhow::{Context, Result, anyhow, bail};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use driftscape_core::preset::{Genre, Station, builtin_genres};
-use driftscape_engine::{Config, Event, Params, Session, listener_or_default};
+use driftscape_core::{
+    ambience::{self, Kind},
+    preset::{Genre, Station, builtin_genres},
+};
+use driftscape_engine::{BedChoice, Config, Event, Params, Session, listener_or_default};
 use driftscape_infer::musicgen::Backend;
 use std::{
     io::BufRead,
@@ -36,6 +39,53 @@ pub struct Options {
     pub record: Option<PathBuf>,
     /// Stop after this many minutes.
     pub stop_after: Option<f64>,
+    pub bed: BedMode,
+    /// The bed's level in dB, instead of the genre's.
+    pub bed_db: Option<f32>,
+}
+
+/// How the ambience bed is chosen.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BedMode {
+    /// As the genre says (realistic ambience: from the prompt; the others: none).
+    Genre,
+    /// From the prompt's words, whatever the genre.
+    Auto,
+    Off,
+    Fixed(Kind),
+}
+
+impl BedMode {
+    pub fn parse(word: &str) -> Option<BedMode> {
+        match word {
+            "auto" => Some(BedMode::Auto),
+            "off" | "none" => Some(BedMode::Off),
+            "genre" => Some(BedMode::Genre),
+            id => Kind::from_id(id).map(BedMode::Fixed),
+        }
+    }
+}
+
+/// What the session plays besides the music.
+struct Bed {
+    mode: BedMode,
+    db: Option<f32>,
+    /// Words to pick a bed from on radio, where the listener types none: the station's prompts.
+    station_words: Option<String>,
+}
+
+impl Bed {
+    fn choice(&self, params: &Params) -> Option<BedChoice> {
+        let words = self.station_words.as_deref().unwrap_or(&params.prompt);
+        let words = if words.trim().is_empty() { params.genre.default_prompt.as_str() } else { words };
+        let kind = match self.mode {
+            BedMode::Genre => params.genre.bed_for(words),
+            BedMode::Auto => ambience::suggest(words),
+            BedMode::Off => None,
+            BedMode::Fixed(k) => Some(k),
+        }?;
+        Some(BedChoice { kind, db: self.db.or(params.genre.bed_db).unwrap_or(0.0), intensity: 0.6 })
+    }
 }
 
 pub fn run(options: Options) -> Result<()> {
@@ -64,7 +114,14 @@ pub fn run(options: Options) -> Result<()> {
         Some(s) => eprintln!("📻 {} · {}", s.name, s.description),
         None => eprintln!("live · {} · {}", params.genre.name, listener_or_default(&params.prompt, &params.genre)),
     }
-    let (mut session, mut audio) = Session::start(Config { params, station, backend: options.backend, rate })?;
+    let mut bed =
+        Bed { mode: options.bed, db: options.bed_db, station_words: station.as_ref().map(|s| s.prompts.join(", ")) };
+    let first_bed = bed.choice(&params);
+    if let Some(b) = first_bed {
+        eprintln!("bed · {} at {:+.0} dB", b.kind.name(), b.db);
+    }
+    let (mut session, mut audio) =
+        Session::start(Config { params, bed: first_bed, station, backend: options.backend, rate })?;
     {
         // The first Ctrl-C stops cleanly (and saves the recording); a second one exits at once, whatever is stuck.
         let stopper = session.stopper();
@@ -77,23 +134,33 @@ pub fn run(options: Options) -> Result<()> {
         .context("installing the Ctrl-C handler")?;
     }
 
-    // Audio → recorder: the samples played.
-    let (mut record_tx, mut record_rx) = rtrb::RingBuffer::<f32>::new(rate as usize * 4);
+    // Audio → recorder: the stereo frames played, interleaved.
+    let (mut record_tx, mut record_rx) = rtrb::RingBuffer::<f32>::new(rate as usize * 8);
     let recording = options.record.is_some();
-    let mut scratch = vec![0.0f32; 8192];
+    let (mut left, mut right) = (vec![0.0f32; 8192], vec![0.0f32; 8192]);
     let stream = device
         .build_output_stream(
             config,
             move |out: &mut [f32], _| {
-                for frames in out.chunks_mut(scratch.len() * channels) {
-                    let mono = &mut scratch[..frames.len() / channels];
-                    audio.process(mono);
-                    for (frame, &s) in frames.chunks_mut(channels).zip(mono.iter()) {
-                        frame.fill(s);
+                for frames in out.chunks_mut(left.len() * channels) {
+                    let n = frames.len() / channels;
+                    let (l, r) = (&mut left[..n], &mut right[..n]);
+                    audio.process(l, r);
+                    for ((frame, &a), &b) in frames.chunks_mut(channels).zip(l.iter()).zip(r.iter()) {
+                        match frame {
+                            [only] => *only = 0.5 * (a + b),
+                            [fl, fr, rest @ ..] => {
+                                *fl = a;
+                                *fr = b;
+                                rest.fill(0.0);
+                            }
+                            [] => {}
+                        }
                     }
                     if recording {
-                        for &s in mono.iter() {
-                            let _ = record_tx.push(s);
+                        for (&a, &b) in l.iter().zip(r.iter()) {
+                            let _ = record_tx.push(a);
+                            let _ = record_tx.push(b);
                         }
                     }
                 }
@@ -107,10 +174,10 @@ pub fn run(options: Options) -> Result<()> {
     let done = Arc::new(AtomicBool::new(false));
     let recorder = match &options.record {
         Some(path) => {
-            let mut wav = WavRecorder::create(path, rate)?;
+            let mut wav = WavRecorder::create(path, rate, 2)?;
             let done = done.clone();
             Some(thread::Builder::new().name("recorder".into()).spawn(move || -> Result<WavRecorder> {
-                let mut chunk = Vec::with_capacity(rate as usize);
+                let mut chunk = Vec::with_capacity(2 * rate as usize);
                 let mut started = false; // skip the silence while the first segment is generated
                 loop {
                     let finished = done.load(Ordering::Acquire);
@@ -167,9 +234,11 @@ pub fn run(options: Options) -> Result<()> {
                 session.stopper().stop();
                 break;
             }
-            for message in apply(&line, &session, radio) {
+            for message in apply(&line, &session, radio, &mut bed) {
                 eprintln!("{message}");
             }
+            // The bed follows the words and the genre (unless it was fixed or switched off).
+            session.set_bed(bed.choice(&session.params()));
         }
         thread::sleep(Duration::from_millis(30));
     }
@@ -203,14 +272,14 @@ fn spawn_input() -> mpsc::Receiver<String> {
 }
 
 /// Apply one typed line; returns what to print.
-fn apply(line: &str, session: &Session, radio: bool) -> Vec<String> {
+fn apply(line: &str, session: &Session, radio: bool, bed: &mut Bed) -> Vec<String> {
     let mut messages = Vec::new();
     let mut words = line.split_whitespace();
     let command = words.next().unwrap_or("");
     let changed = match command {
         ":help" => {
             messages.push(format!(
-                "  <text>            new prompt (next segment)\n  :genre <id>       switch genre: {}\n  :focus + | -      follow the prompt more or less closely\n  :variety + | -    let the music wander more or less\n  :status           show the current settings\n  :quit             stop and save the recording",
+                "  <text>            new prompt (next segment)\n  :genre <id>       switch genre: {}\n  :bed <kind>       ambience under the music: rain, wind, waves, fire, auto, off\n  :bed <dB>         the bed's level, e.g. :bed -6\n  :focus + | -      follow the prompt more or less closely\n  :variety + | -    let the music wander more or less\n  :status           show the current settings\n  :quit             stop and save the recording",
                 builtin_genres().iter().map(|g| g.id.as_str()).collect::<Vec<_>>().join(", ")
             ));
             false
@@ -225,6 +294,27 @@ fn apply(line: &str, session: &Session, radio: bool) -> Vec<String> {
                 false
             }
         },
+        ":bed" => {
+            match words.next() {
+                Some(word) if word.parse::<f32>().is_ok() => {
+                    bed.db = word.parse().ok();
+                    messages.push(format!("  bed level {:+.0} dB", bed.db.unwrap_or(0.0)));
+                }
+                Some(word) => match BedMode::parse(word) {
+                    Some(mode) => {
+                        bed.mode = mode;
+                        let now = bed.choice(&session.params());
+                        messages.push(format!("  bed → {}", now.map_or("off", |b| b.kind.name())));
+                    }
+                    None => messages.push("  :bed rain | wind | waves | fire | auto | off | <dB>".into()),
+                },
+                None => messages.push(format!(
+                    "  bed: {}",
+                    session.bed().map_or("off".to_owned(), |b| format!("{} at {:+.0} dB", b.kind.name(), b.db))
+                )),
+            }
+            false
+        }
         ":focus" | ":variety" => {
             let up = words.next() != Some("-");
             let mut now = 0.0;

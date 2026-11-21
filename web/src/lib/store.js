@@ -94,15 +94,15 @@ export const deleteTake = (id) => tx("takes", "readwrite", (t) => t.objectStore(
 // ---- recordings --------------------------------------------------------------------------------------------------
 
 /** Start a recording; returns its id. */
-export async function startRecording({ sampleRate, label }) {
+export async function startRecording({ sampleRate, label, channels = 1 }) {
   const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   await tx("recordings", "readwrite", (t) =>
-    t.objectStore("recordings").put({ id, sampleRate, label, startedAt: Date.now(), frames: 0, chunks: 0, done: false }),
+    t.objectStore("recordings").put({ id, sampleRate, channels, label, startedAt: Date.now(), frames: 0, chunks: 0, done: false }),
   );
   return id;
 }
 
-/** Append 16-bit samples to a recording. */
+/** Append 16-bit samples (interleaved, for a stereo recording) to a recording. */
 export async function appendRecording(id, samples) {
   const d = await db();
   return new Promise((resolve, reject) => {
@@ -114,7 +114,7 @@ export async function appendRecording(id, samples) {
       if (!rec) return;
       t.objectStore("chunks").put({ recording: id, seq: rec.chunks, data: samples });
       rec.chunks += 1;
-      rec.frames += samples.length;
+      rec.frames += samples.length / (rec.channels ?? 1);
       recordings.put(rec);
     };
     t.oncomplete = () => resolve();
@@ -141,7 +141,7 @@ export async function listRecordings() {
   return all.sort((a, b) => b.startedAt - a.startedAt);
 }
 
-/** A recording as a mono 16-bit WAV Blob. */
+/** A recording as a 16-bit WAV Blob (mono for recordings made before stereo). */
 export async function recordingWav(id) {
   const rec = await tx("recordings", "readonly", (t) => t.objectStore("recordings").get(id));
   const chunks = await tx("chunks", "readonly", (t) => t.objectStore("chunks").index("recording").getAll(id));
@@ -149,6 +149,7 @@ export async function recordingWav(id) {
   return wav(
     chunks.map((c) => c.data),
     rec.sampleRate,
+    rec.channels ?? 1,
   );
 }
 
@@ -163,23 +164,23 @@ export async function deleteRecording(id) {
   });
 }
 
-/** Mono 16-bit WAV from Int16 chunks. */
-export function wav(chunks, sampleRate) {
-  const frames = chunks.reduce((n, c) => n + c.length, 0);
+/** 16-bit WAV from Int16 chunks (interleaved when `channels` is 2). */
+export function wav(chunks, sampleRate, channels = 1) {
+  const samples = chunks.reduce((n, c) => n + c.length, 0);
   const header = new DataView(new ArrayBuffer(44));
   const text = (at, s) => [...s].forEach((ch, i) => header.setUint8(at + i, ch.charCodeAt(0)));
   text(0, "RIFF");
-  header.setUint32(4, 36 + frames * 2, true);
+  header.setUint32(4, 36 + samples * 2, true);
   text(8, "WAVEfmt ");
   header.setUint32(16, 16, true);
   header.setUint16(20, 1, true);
-  header.setUint16(22, 1, true);
+  header.setUint16(22, channels, true);
   header.setUint32(24, sampleRate, true);
-  header.setUint32(28, sampleRate * 2, true);
-  header.setUint16(32, 2, true);
+  header.setUint32(28, sampleRate * 2 * channels, true);
+  header.setUint16(32, 2 * channels, true);
   header.setUint16(34, 16, true);
   text(36, "data");
-  header.setUint32(40, frames * 2, true);
+  header.setUint32(40, samples * 2, true);
   return new Blob([header, ...chunks], { type: "audio/wav" });
 }
 

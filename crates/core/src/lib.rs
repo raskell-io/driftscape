@@ -12,8 +12,10 @@
 //! - [`looping`]: cut a clip to whole bars and make the wrap-around seamless; find where to rejoin a repeat.
 //! - [`mixer`]: the real-time mixer live mode plays through.
 //! - [`preset`]: genres and stations.
+//! - [`ambience`]: procedural rain, wind, waves and fire beds.
 //! - [`arrange`]: producer mode's timeline of layered clips, and its mixdown.
 
+pub mod ambience;
 pub mod arrange;
 pub mod audio;
 pub mod looping;

@@ -10,8 +10,13 @@
 //!
 //! Exported as CLAP. VST3 and AU come from wrapping the CLAP with clap-wrapper (`plugin/wrap/`).
 
-use driftscape_core::preset::{Genre, builtin_genres};
-use driftscape_engine::{AudioSide, Config, Event, Params as EngineParams, Session, VoiceBackend, listener_or_default};
+use driftscape_core::{
+    ambience::Kind,
+    preset::{Genre, builtin_genres},
+};
+use driftscape_engine::{
+    AudioSide, BedChoice, Config, Event, Params as EngineParams, Session, VoiceBackend, listener_or_default,
+};
 use nih_plug::prelude::*;
 use nih_plug_egui::{EguiState, create_egui_editor, egui, widgets};
 use std::sync::{Arc, Mutex, RwLock};
@@ -25,7 +30,7 @@ pub struct Driftscape {
     engine: Arc<Mutex<Option<Session>>>,
     /// The real-time half of the session, owned by the audio thread.
     audio: Option<AudioSide>,
-    scratch: Vec<f32>,
+    scratch: [Vec<f32>; 2],
     /// What the engine was last told (genre index, focus, wander, tempo), to notice changes in `process`.
     sent: Option<Steer>,
     status: Arc<Mutex<String>>,
@@ -38,7 +43,13 @@ pub struct Steer {
     wander: f32,
     /// The host's tempo, for genres with a beat (rounded to a tenth of a BPM).
     bpm: Option<f32>,
+    /// 0: as the genre says, 1: off, 2..: a kind ([`BED_NAMES`]).
+    bed: i32,
+    bed_db: f32,
 }
+
+/// The Bed parameter's choices.
+const BED_NAMES: [&str; 6] = ["Genre", "Off", "Rain", "Wind", "Waves", "Fire"];
 
 /// Work done off the audio thread.
 pub enum Task {
@@ -69,6 +80,11 @@ pub struct DriftscapeParams {
     /// Play even while the host's transport is stopped.
     #[id = "free"]
     pub free_run: BoolParam,
+    /// The ambience bed under the music.
+    #[id = "bed"]
+    pub bed: IntParam,
+    #[id = "bed-level"]
+    pub bed_level: FloatParam,
 }
 
 impl DriftscapeParams {
@@ -98,6 +114,11 @@ impl DriftscapeParams {
             .with_string_to_value(formatters::s2v_f32_gain_to_db()),
             follow_tempo: BoolParam::new("Follow tempo", true),
             free_run: BoolParam::new("Free run", false),
+            bed: IntParam::new("Bed", 0, IntRange::Linear { min: 0, max: BED_NAMES.len() as i32 - 1 })
+                .with_value_to_string(Arc::new(|i| BED_NAMES.get(i as usize).unwrap_or(&"").to_string())),
+            bed_level: FloatParam::new("Bed level", 0.0, FloatRange::Linear { min: -24.0, max: 6.0 })
+                .with_step_size(1.0)
+                .with_unit(" dB"),
         }
     }
 }
@@ -110,7 +131,7 @@ impl Default for Driftscape {
             genres: Arc::new(genres),
             engine: Arc::new(Mutex::new(None)),
             audio: None,
-            scratch: Vec::new(),
+            scratch: [Vec::new(), Vec::new()],
             sent: None,
             status: Arc::new(Mutex::new("Starting".into())),
         }
@@ -124,8 +145,26 @@ impl Driftscape {
             (Some(_), true, Some(t)) if (40.0..=220.0).contains(&t) => Some((t * 10.0).round() as f32 / 10.0),
             _ => None,
         };
-        Steer { genre, focus: self.params.focus.value(), wander: self.params.wander.value(), bpm }
+        Steer {
+            genre,
+            focus: self.params.focus.value(),
+            wander: self.params.wander.value(),
+            bpm,
+            bed: self.params.bed.value(),
+            bed_db: self.params.bed_level.value(),
+        }
     }
+}
+
+/// The bed for a steer and the engine's parameters.
+fn bed_choice(steer: Steer, params: &EngineParams) -> Option<BedChoice> {
+    let kind = match steer.bed {
+        0 => params.genre.bed_for(&params.prompt)?,
+        1 => return None,
+        i => Kind::from_index(i as u32 - 2)?,
+    };
+    let db = if steer.bed == 0 { params.genre.bed_db.unwrap_or(0.0) + steer.bed_db } else { steer.bed_db };
+    Some(BedChoice { kind, db, intensity: 0.6 })
 }
 
 /// The engine's parameters for a steer and a mood.
@@ -166,6 +205,7 @@ impl Plugin for Driftscape {
                 let mood = params.mood.read().map(|m| m.clone()).unwrap_or_default();
                 if let Some(session) = engine.lock().unwrap().as_ref() {
                     let next = engine_params(&genres, steer, &mood);
+                    session.set_bed(bed_choice(steer, &next));
                     session.update(|p| *p = next);
                 }
             }
@@ -178,15 +218,17 @@ impl Plugin for Driftscape {
         config: &BufferConfig,
         context: &mut impl InitContext<Self>,
     ) -> bool {
-        self.scratch = vec![0.0; config.max_buffer_size as usize];
+        self.scratch = [vec![0.0; config.max_buffer_size as usize], vec![0.0; config.max_buffer_size as usize]];
         let steer = self.steer_now(None);
         let mood = self.params.mood.read().map(|m| m.clone()).unwrap_or_default();
         // A new sample rate means a new session; the old one stops first (at most one model step).
         let mut engine = self.engine.lock().unwrap();
         *engine = None;
         self.audio = None;
+        let params = engine_params(&self.genres, steer, &mood);
         match Session::start(Config {
-            params: engine_params(&self.genres, steer, &mood),
+            bed: bed_choice(steer, &params),
+            params,
             station: None,
             backend: VoiceBackend::Gpu,
             rate: config.sample_rate.round() as u32,
@@ -222,18 +264,19 @@ impl Plugin for Driftscape {
         }
 
         let n = buffer.samples();
-        let Some(audio) = self.audio.as_mut().filter(|_| running && n <= self.scratch.len()) else {
+        let Some(audio) = self.audio.as_mut().filter(|_| running && n <= self.scratch[0].len()) else {
             for channel in buffer.as_slice() {
                 channel.fill(0.0);
             }
             return ProcessStatus::Normal;
         };
-        let mono = &mut self.scratch[..n];
-        audio.process(mono);
+        let [left, right] = &mut self.scratch;
+        let (left, right) = (&mut left[..n], &mut right[..n]);
+        audio.process(left, right);
         for (i, mut frame) in buffer.iter_samples().enumerate() {
             let gain = self.params.level.smoothed.next();
-            for s in frame.iter_mut() {
-                *s = mono[i] * gain;
+            for (c, s) in frame.iter_mut().enumerate() {
+                *s = if c == 0 { left[i] } else { right[i] } * gain;
             }
         }
         ProcessStatus::KeepAlive
@@ -298,6 +341,16 @@ impl Plugin for Driftscape {
                             if let Some(session) = engine.lock().unwrap().as_ref() {
                                 let words = draft.clone();
                                 session.update(|p| p.prompt = words);
+                                // On "Genre", the bed follows the new words (rain, sea, fire…).
+                                let steer = Steer {
+                                    genre: (params.genre.value().max(0) as usize).min(genres.len() - 1),
+                                    focus: params.focus.value(),
+                                    wander: params.wander.value(),
+                                    bpm: None,
+                                    bed: params.bed.value(),
+                                    bed_db: params.bed_level.value(),
+                                };
+                                session.set_bed(bed_choice(steer, &session.params()));
                             }
                         }
                         ui.end_row();
@@ -310,6 +363,21 @@ impl Plugin for Driftscape {
                         ui.end_row();
                         ui.label("Level");
                         ui.add(widgets::ParamSlider::for_param(&params.level, setter).with_width(240.0));
+                        ui.end_row();
+                        ui.label("Bed");
+                        ui.horizontal(|ui| {
+                            for (i, name) in BED_NAMES.iter().enumerate() {
+                                let on = params.bed.value() == i as i32;
+                                if ui.selectable_label(on, *name).clicked() {
+                                    setter.begin_set_parameter(&params.bed);
+                                    setter.set_parameter(&params.bed, i as i32);
+                                    setter.end_set_parameter(&params.bed);
+                                }
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("Bed level");
+                        ui.add(widgets::ParamSlider::for_param(&params.bed_level, setter).with_width(240.0));
                         ui.end_row();
                     });
 
@@ -366,12 +434,18 @@ mod tests {
         let plugin = Driftscape::default();
         let techno = plugin.genres.iter().position(|g| g.bpm.is_some()).expect("a genre with a beat");
         let ambient = plugin.genres.iter().position(|g| g.bpm.is_none()).expect("a genre without one");
-        let p = engine_params(&plugin.genres, Steer { genre: techno, focus: 1.0, wander: -1.0, bpm: Some(124.0) }, "");
+        let steer = |genre, bpm| Steer { genre, focus: 1.0, wander: -1.0, bpm, bed: 0, bed_db: 0.0 };
+        let p = engine_params(&plugin.genres, steer(techno, Some(124.0)), "");
         assert_eq!(p.genre.bpm, Some(124.0));
         assert_eq!((p.focus, p.variety), (0.5, -0.1));
-        let p =
-            engine_params(&plugin.genres, Steer { genre: ambient, focus: 0.0, wander: 0.0, bpm: Some(124.0) }, "rain");
+        let p = engine_params(&plugin.genres, steer(ambient, Some(124.0)), "rain");
         assert_eq!(p.genre.bpm, None);
         assert_eq!(p.prompt, "rain");
+        assert_eq!(bed_choice(steer(ambient, None), &p), None, "ambient has no bed of its own");
+        let fixed = Steer { bed: 4, bed_db: -6.0, ..steer(ambient, None) };
+        assert_eq!(bed_choice(fixed, &p).map(|b| (b.kind, b.db)), Some((Kind::Waves, -6.0)));
+        let realistic = plugin.genres.iter().position(|g| g.id == "realistic-ambience").unwrap();
+        let p = engine_params(&plugin.genres, steer(realistic, None), "campfire at night");
+        assert_eq!(bed_choice(steer(realistic, None), &p).map(|b| b.kind), Some(Kind::Fire));
     }
 }

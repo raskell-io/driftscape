@@ -177,3 +177,60 @@ pub extern "C" fn arr_render() -> i64 {
 pub extern "C" fn arr_output(channel: u32) -> *const f32 {
     producer().output.as_ref().and_then(|o| o.channels.get(channel as usize)).map_or(std::ptr::null(), |c| c.as_ptr())
 }
+
+// Ambience beds (see `driftscape_core::ambience`): a seamless loop for the browser to repeat, and the bed a description
+// calls for. Text goes in through [`text`] as UTF-8.
+
+use driftscape_core::ambience::{self, Kind};
+
+static mut BED: Option<Audio> = None;
+static mut TEXT: Vec<u8> = Vec::new();
+
+/// Render `seconds` of bed `kind` (0 rain, 1 wind, 2 waves, 3 fire) that loops without a seam. Returns the frames, or -1
+/// for an unknown kind. The channels are then at [`bed_channel`].
+#[unsafe(no_mangle)]
+pub extern "C" fn bed_loop(kind: u32, rate: u32, seconds: f32, seed: u32, intensity: f32) -> i64 {
+    let Some(kind) = Kind::from_index(kind) else { return -1 };
+    if rate == 0 || !(1.0..=600.0).contains(&seconds) {
+        return -1;
+    }
+    let audio = ambience::render_loop(kind, rate, seconds, 3.0f32.min(seconds / 4.0), u64::from(seed), intensity);
+    let n = audio.len() as i64;
+    // SAFETY: single-threaded module; nothing borrows BED across calls.
+    #[allow(static_mut_refs)]
+    unsafe {
+        BED = Some(audio);
+    }
+    n
+}
+
+/// The last bed loop's channel (0 left, 1 right), or null.
+#[unsafe(no_mangle)]
+pub extern "C" fn bed_channel(channel: u32) -> *const f32 {
+    // SAFETY: as above.
+    #[allow(static_mut_refs)]
+    unsafe {
+        BED.as_ref().and_then(|b| b.channels.get(channel as usize)).map_or(std::ptr::null(), |c| c.as_ptr())
+    }
+}
+
+/// Make room for `len` bytes of UTF-8 text and return where they go.
+#[unsafe(no_mangle)]
+pub extern "C" fn text(len: u32) -> *mut u8 {
+    // SAFETY: as above.
+    #[allow(static_mut_refs)]
+    unsafe {
+        TEXT.clear();
+        TEXT.resize(len as usize, 0);
+        TEXT.as_mut_ptr()
+    }
+}
+
+/// The bed the text calls for (its index, as for [`bed_loop`]), or -1.
+#[unsafe(no_mangle)]
+pub extern "C" fn bed_suggest() -> i32 {
+    // SAFETY: as above.
+    #[allow(static_mut_refs)]
+    let text = unsafe { std::str::from_utf8(&TEXT).unwrap_or("") };
+    ambience::suggest(text).and_then(|k| Kind::ALL.iter().position(|x| *x == k)).map_or(-1, |i| i as i32)
+}

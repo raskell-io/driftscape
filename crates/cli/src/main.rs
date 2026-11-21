@@ -158,9 +158,24 @@ struct SessionArgs {
     /// Stop by itself after this many minutes, like a sleep timer.
     #[arg(long)]
     stop_after: Option<f64>,
+    /// An ambience bed under the music: rain, wind, waves or fire; auto picks one from the prompt; off. Defaults to
+    /// the genre's (realistic-ambience: auto).
+    #[arg(long)]
+    bed: Option<String>,
+    /// The bed's level in dB; 0 sits a few dB under the music.
+    #[arg(long, allow_hyphen_values = true)]
+    bed_level: Option<f32>,
 }
 
 impl SessionArgs {
+    fn bed(&self) -> Result<live::BedMode> {
+        Ok(match self.bed.as_deref() {
+            None => live::BedMode::Genre,
+            Some(word) => live::BedMode::parse(word)
+                .with_context(|| format!("no bed `{word}`; choose rain, wind, waves, fire, auto or off"))?,
+        })
+    }
+
     fn record_path(&self, name: &str) -> Option<PathBuf> {
         if self.no_record {
             return None;
@@ -214,6 +229,8 @@ fn main() -> Result<()> {
                 backend: session.device.into(),
                 record,
                 stop_after: session.stop_after,
+                bed: session.bed()?,
+                bed_db: session.bed_level,
             })?;
         }
         Command::Serve { port, device, no_open } => serve::run(port, device.into(), !no_open)?,
@@ -255,6 +272,8 @@ fn main() -> Result<()> {
                 backend: session.device.into(),
                 record,
                 stop_after: session.stop_after,
+                bed: session.bed()?,
+                bed_db: session.bed_level,
             })?;
         }
         Command::Gen { prompt, output, seconds, bpm, bars, rate, seed, guidance, device } => {

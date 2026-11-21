@@ -1,7 +1,8 @@
 //! Run a live session without an audio device, the way a plugin host drives it: call `process` in blocks at real-time
 //! pace, change the prompt part-way, and write what was produced to a WAV file. Nothing plays.
 //!
-//! cargo run --release -p driftscape-engine --example headless -- <out.wav> [seconds] [tweak-at-seconds]
+//! cargo run --release -p driftscape-engine --example headless -- <out.wav> [seconds] [tweak-at-seconds] [bed]
+//! (the left channel is analysed and written)
 
 use driftscape_core::{
     Audio,
@@ -18,8 +19,11 @@ fn main() -> anyhow::Result<()> {
     let tweak_at: f64 = args.get(3).map_or(20.0, |s| s.parse().unwrap());
     let rate = 48_000;
     let genre = builtin_genres().into_iter().find(|g| g.id == "ambient").unwrap();
+    let params = Params::new(genre, "dusk over a quiet harbour");
+    let bed = std::env::args().nth(4).and_then(|k| driftscape_core::ambience::Kind::from_id(&k));
     let (session, mut audio) = Session::start(Config {
-        params: Params::new(genre, "dusk over a quiet harbour"),
+        bed: bed.map(|kind| driftscape_engine::BedChoice { kind, db: 0.0, intensity: 0.6 }),
+        params,
         station: None,
         backend: VoiceBackend::Gpu,
         rate,
@@ -28,6 +32,7 @@ fn main() -> anyhow::Result<()> {
     let block = 512;
     let mut samples = Vec::new();
     let mut buf = vec![0.0f32; block];
+    let mut right = vec![0.0f32; block];
     let started = Instant::now();
     let mut tweaked = false;
     let mut first_sound = None;
@@ -37,7 +42,7 @@ fn main() -> anyhow::Result<()> {
         if let Some(wait) = due.checked_sub(started.elapsed()) {
             std::thread::sleep(wait);
         }
-        audio.process(&mut buf);
+        audio.process(&mut buf, &mut right);
         if first_sound.is_none() && buf.iter().any(|s| s.abs() > 1e-4) {
             first_sound = Some(samples.len());
         }

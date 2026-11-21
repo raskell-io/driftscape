@@ -8,6 +8,8 @@
   import Knob from "#lib/ui/Knob.svelte";
   import Receiver from "#lib/ui/Receiver.svelte";
   import Rack from "#lib/ui/Rack.svelte";
+  import { BEDS, bedFor } from "#lib/bed.js";
+  import { loadCore } from "#lib/producer/mixdown.js";
 
   let presets = $state({ genres: [], stations: [] });
   let mode = $state("live"); // "live" | "radio" | "producer"
@@ -19,6 +21,10 @@
   let wander = $state(0); // -2..2, steps of 0.1 temperature
   let drift = $state(3); // 0..10, the terrain's autopilot
   let level = $state(8); // 0..10
+  let bedChoice = $state("auto"); // "auto" (as the genre says) | "off" | a bed id
+  let bedLevel = $state(0); // dB
+  let heard = $state(""); // the mood the music was last steered with (the bed follows it, not each keystroke)
+  let core = $state(null);
   let stationId = $state(null);
   let settingsLoaded = $state(false);
 
@@ -71,7 +77,8 @@
     ]);
     presets = loaded;
     if (settings) {
-      ({ mode = "live", prompt = "", focus = 0, wander = 0, drift = 3, level = 8 } = settings);
+      ({ mode = "live", prompt = "", focus = 0, wander = 0, drift = 3, level = 8, bedChoice = "auto", bedLevel = 0 } = settings);
+      heard = prompt;
       if (settings.dot) dot = settings.dot;
       if (settings.landmarks) landmarks = settings.landmarks;
     }
@@ -79,6 +86,7 @@
     settingsLoaded = true;
     if (session?.audio) resumable = session;
     refreshLibrary();
+    loadCore().then((c) => (core = c), () => {});
 
     voice = await chooseVoice(({ detail, fraction }) => (engineState = { phase: "loading", detail, fraction }));
     native = voice.label.includes("engine");
@@ -96,8 +104,21 @@
   });
 
   $effect(() => {
-    const settings = { mode, prompt, focus, wander, drift, level, dot: { ...dot }, landmarks: landmarks.map((l) => ({ ...l })) };
+    const settings = { mode, prompt, focus, wander, drift, level, bedChoice, bedLevel, dot: { ...dot }, landmarks: landmarks.map((l) => ({ ...l })) };
     if (settingsLoaded) store.saveSettings(settings);
+  });
+
+  // The bed under the music: the genre's (realistic ambience picks one from the mood), or the listener's choice.
+  const bed = $derived.by(() => {
+    if (!core) return null;
+    if (stationId && station) {
+      const g = presets.genres.find((x) => x.id === station.genre);
+      return bedFor(core, g, station.prompts.join(", "), bedChoice);
+    }
+    return mix ? bedFor(core, mix.genre, heard, bedChoice) : null;
+  });
+  $effect(() => {
+    engine?.setBed(bed ? { id: bed, db: bedLevel } : null);
   });
 
   async function refreshLibrary() {
@@ -167,6 +188,7 @@
     begin();
     stationId = null;
     sent = mix;
+    heard = prompt;
     await engine.start({ genre: mix.genre, blend: mix.blend, prompt, focus: focus * 0.5, variety: wander * 0.1 });
   }
 
@@ -194,6 +216,7 @@
     if (words) {
       landmarks = [...landmarks.slice(-3), { x: dot.x, y: dot.y, word: words.split(/\s+/).slice(0, 3).join(" ") }];
     }
+    heard = prompt;
     if (live) engine.tweak({ prompt });
     else if (engineReady) playLive();
   }
@@ -228,7 +251,7 @@
     begin();
     stationId = s?.id ?? null;
     mode = s ? "radio" : "live";
-    if (!s) prompt = snap.params.prompt;
+    if (!s) prompt = heard = snap.params.prompt;
     sent = s ? null : { genre: g, blend: b ? { genre: b, share: snap.params.blendShare } : null };
     await engine.start({
       genre: g,
@@ -410,7 +433,17 @@
     {/if}
   {/if}
 
-  {#if mode !== "producer"}<div class="status" aria-live="polite">
+  {#if mode !== "producer"}
+    <div class="bedrow" aria-label="Ambience bed">
+      <span class="label">Bed</span>
+      <div class="beds" role="radiogroup" aria-label="Bed under the music">
+        {#each [{ id: "auto", name: bedChoice === "auto" && bed ? `Auto · ${BEDS.find((b) => b.id === bed)?.name}` : "Auto" }, { id: "off", name: "Off" }, ...BEDS] as b (b.id)}
+          <button class="place" class:here={bedChoice === b.id} role="radio" aria-checked={bedChoice === b.id} onclick={() => (bedChoice = b.id)}>{b.name}</button>
+        {/each}
+      </div>
+      <Knob label="Bed" size={34} min={-24} max={6} bind:value={bedLevel} format={(v) => `${v > 0 ? "+" : ""}${v} dB`} />
+    </div>
+    <div class="status" aria-live="polite">
     {#if playing}
       <p class="now">
         {nowPlaying ||
@@ -519,6 +552,10 @@
     .knobs { flex-direction: row; justify-content: space-around; }
   }
   .legend { display: flex; flex-wrap: wrap; gap: 6px; }
+  .bedrow { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .bedrow .label { margin: 0; }
+  .beds { display: flex; flex-wrap: wrap; gap: 6px; flex: 1; }
+  .bedrow :global(.knob) { gap: 3px; }
   .place { border: 1px solid var(--line); background: none; border-radius: 999px; padding: 0.3rem 0.75rem; cursor: pointer;
     font: 500 12px var(--display); color: var(--muted); }
   .place.here { color: var(--ink); border-color: var(--peach); }

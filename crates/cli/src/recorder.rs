@@ -8,21 +8,23 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Mono 24-bit PCM.
+/// 24-bit PCM, interleaved.
 pub struct WavRecorder {
     out: BufWriter<File>,
     path: PathBuf,
-    frames: u32,
+    channels: u16,
+    /// Samples written (all channels).
+    samples: u32,
 }
 
 impl WavRecorder {
-    pub fn create(path: &Path, sample_rate: u32) -> Result<Self> {
+    pub fn create(path: &Path, sample_rate: u32, channels: u16) -> Result<Self> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
         let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
         let mut out = BufWriter::new(file);
-        let (channels, bits) = (1u16, 24u16);
+        let bits = 24u16;
         let block_align = channels * bits / 8;
         out.write_all(b"RIFF\0\0\0\0WAVEfmt ")?;
         out.write_all(&16u32.to_le_bytes())?;
@@ -33,25 +35,26 @@ impl WavRecorder {
         out.write_all(&block_align.to_le_bytes())?;
         out.write_all(&bits.to_le_bytes())?;
         out.write_all(b"data\0\0\0\0")?;
-        Ok(Self { out, path: path.to_owned(), frames: 0 })
+        Ok(Self { out, path: path.to_owned(), channels, samples: 0 })
     }
 
+    /// Append interleaved samples.
     pub fn write(&mut self, samples: &[f32]) -> Result<()> {
         for &s in samples {
             let v = (s.clamp(-1.0, 1.0) * 8_388_607.0).round() as i32;
             self.out.write_all(&v.to_le_bytes()[..3])?;
         }
-        self.frames += samples.len() as u32;
+        self.samples += samples.len() as u32;
         Ok(())
     }
 
     pub fn seconds(&self, sample_rate: u32) -> f64 {
-        f64::from(self.frames) / f64::from(sample_rate)
+        f64::from(self.samples / u32::from(self.channels)) / f64::from(sample_rate)
     }
 
     /// Fill in the sizes and close the file.
     pub fn finish(mut self) -> Result<PathBuf> {
-        let data = self.frames * 3;
+        let data = self.samples * 3;
         self.out.seek(SeekFrom::Start(4))?;
         self.out.write_all(&(36 + data).to_le_bytes())?;
         self.out.seek(SeekFrom::Start(40))?;
@@ -85,15 +88,18 @@ mod tests {
     #[test]
     fn recording_is_a_valid_wav() {
         let path = std::env::temp_dir().join(format!("driftscape-rec-test-{}.wav", std::process::id()));
-        let mut r = WavRecorder::create(&path, 48_000).unwrap();
+        let mut r = WavRecorder::create(&path, 48_000, 2).unwrap();
         r.write(&[0.0, 0.5, -0.5]).unwrap();
         r.write(&[0.25]).unwrap();
+        assert_eq!(r.seconds(48_000), 2.0 / 48_000.0);
         let path = r.finish().unwrap();
         let audio = driftscape_core::wav::decode(&std::fs::read(&path).unwrap()).unwrap();
         std::fs::remove_file(&path).unwrap();
         assert_eq!(audio.sample_rate, 48_000);
-        assert_eq!(audio.len(), 4);
-        assert!((audio.channels[0][1] - 0.5).abs() < 1e-6);
+        assert_eq!(audio.channel_count(), 2);
+        assert_eq!(audio.len(), 2);
+        assert!((audio.channels[1][0] - 0.5).abs() < 1e-6);
+        assert!((audio.channels[1][1] - 0.25).abs() < 1e-6);
     }
 
     #[test]
