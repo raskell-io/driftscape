@@ -70,7 +70,15 @@ Planned: `crates/plugin` (nih-plug CLAP, wrapped to VST3/AU with clap-wrapper), 
   calls `navigator.storage.persist()` after loading.
 - Service worker: a new deploy waits; the page shows "A new version is ready · Reload" and only then sends
   `skip-waiting`. Never reload on `controllerchange` unless the listener asked (a first install also fires it).
-- The voice worker warms up WebGPU after loading (two tiny generations) so the first play doesn't compile shaders.
+- Browser backends (web/src/lib/voice): `webgpu` = onnxruntime-web's native WebGPU (asyncify build; Chrome, Edge,
+  Safari), `webgpu-js` = its JavaScript WebGPU (jsep build; tried first in Firefox, where the native one crashes with a
+  wasm memory fault), `cpu` = wasm (fallback everywhere, about 0.1x real time; threads need COOP+COEP). `?engine=gpu|jsep|cpu`
+  forces one. A crash or failed self-check falls back to the CPU.
+- Self-check at load (it doubles as the warm-up): decode reference tokens and compare level and zero-crossing rate with
+  the native decode (selfcheck.reference.json, from `--example greedy -- <dir> cpu --json`); if the audio decoder is
+  wrong on the GPU, it moves to the CPU. Then greedy decoding must open with the reference tokens. Found: the jsep
+  WebGPU build decodes EnCodec wrongly (same tokens, 3x the level, not music) while its decoder is right.
+- Never trust "it runs" for audio: check output against the native reference before calling a backend working.
 - - UI (chosen 2026-11-21; see the concept page https://claude.ai/artifact/5FKYXGJzmyuxeDDCmRGKmr): instruments, calm
   rather than skeuomorphic. Live = Terrain (web/src/lib/ui/Terrain.svelte, logic in terrain.js): genres are hills on a
   contour map, the dot's position gives a genre plus a blended second one (Genre.flavor words). Dragging steers urgently;

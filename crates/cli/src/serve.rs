@@ -134,6 +134,7 @@ fn handle(mut request: tiny_http::Request, voice: &Mutex<MusicGen>, latest: &Ato
                         Response::from_data(f.data.into_owned())
                             .with_header(header("content-type", &mime))
                             .with_header(header("cross-origin-opener-policy", "same-origin"))
+                            .with_header(header("cross-origin-embedder-policy", "require-corp"))
                             .with_header(header("cache-control", "no-cache")),
                     )?;
                 }

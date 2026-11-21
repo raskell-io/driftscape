@@ -14,9 +14,12 @@ import { version } from "$app/env";
 
 const CACHE = `app-${version}`;
 const ASSETS = new Set([...immutable, ...assets, ...prerendered].map(({ path }) => (path.startsWith("/") ? path : "/" + path)));
+// The three ONNX runtimes (4–7 MB each) are not precached: a browser only ever uses one. It is cached when first used.
+const RUNTIME = (path) => path.startsWith("/ort/");
+const PRECACHE = [...ASSETS].filter((p) => !RUNTIME(p));
 
 self.addEventListener("install", (event) => {
-  event.waitUntil(caches.open(CACHE).then((c) => c.addAll([...ASSETS])));
+  event.waitUntil(caches.open(CACHE).then((c) => c.addAll(PRECACHE)));
 });
 
 self.addEventListener("message", (event) => {
@@ -36,7 +39,15 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
   if (event.request.method !== "GET" || url.origin !== location.origin || url.pathname.startsWith("/api/")) return;
   if (ASSETS.has(url.pathname)) {
-    event.respondWith(caches.match(url.pathname).then((hit) => hit || fetch(event.request)));
+    event.respondWith(
+      (async () => {
+        const hit = await caches.match(url.pathname);
+        if (hit) return hit;
+        const res = await fetch(event.request);
+        if (res.ok && RUNTIME(url.pathname)) (await caches.open(CACHE)).put(url.pathname, res.clone());
+        return res;
+      })(),
+    );
     return;
   }
   event.respondWith(

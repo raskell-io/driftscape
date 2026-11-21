@@ -1,6 +1,6 @@
 <script>
   import { onMount } from "svelte";
-  import { chooseVoice } from "#lib/voice/voice.js";
+  import { chooseVoice, explain } from "#lib/voice/voice.js";
   import { LiveEngine } from "#lib/engine.js";
   import * as store from "#lib/store.js";
   import { blendAt, differs, regions } from "#lib/ui/terrain.js";
@@ -78,16 +78,16 @@
     refreshLibrary();
 
     const voice = await chooseVoice(({ detail, fraction }) => (engineState = { phase: "loading", detail, fraction }));
-    voiceLabel = voice.label;
     native = voice.label.includes("engine");
     engine = new LiveEngine(voice, onEvent);
     engine.setLevel(level / 10);
     try {
       await voice.ready();
       engineState = { phase: "ready", detail: "Ready", fraction: 1 };
+      voiceLabel = voice.label; // after loading: the in-browser voice may have switched to the CPU
       if (!native) await store.persist();
     } catch (e) {
-      engineState = { phase: "failed", detail: e.message, fraction: 0 };
+      engineState = { phase: "failed", detail: explain(e.message), fraction: 0 };
     }
     refreshLibrary();
   });
@@ -144,7 +144,7 @@
     } else if (e.type === "snapshot") {
       store.saveSession(e.snapshot);
     } else if (e.type === "error") {
-      error = e.message;
+      error = explain(e.message);
     }
   }
 

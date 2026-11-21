@@ -19,10 +19,15 @@ echo "driftscape.wasm: $size bytes (budget $BUDGET)"
 
 cargo run --release -q -p driftscape --manifest-path "$root/Cargo.toml" -- presets --json > static/presets.json
 
+# Three ONNX Runtime builds: WebGPU through its native (asyncify) implementation for Chrome, Edge and Safari; WebGPU
+# through its JavaScript implementation (jsep), tried first in Firefox, where the native one crashes; and the CPU-only
+# build as the fallback everywhere. Each wasm ships gzipped; the worker unpacks it.
 ort=node_modules/onnxruntime-web/dist
 mkdir -p static/ort
-cp "$ort/ort-wasm-simd-threaded.asyncify.mjs" static/ort/
-if [ ! -f static/ort/ort-wasm-simd-threaded.asyncify.wasm.gz ] || [ "$ort/ort-wasm-simd-threaded.asyncify.wasm" -nt static/ort/ort-wasm-simd-threaded.asyncify.wasm.gz ]; then
-  gzip -9 -c "$ort/ort-wasm-simd-threaded.asyncify.wasm" > static/ort/ort-wasm-simd-threaded.asyncify.wasm.gz
-fi
-echo "ort runtime: $(wc -c < static/ort/ort-wasm-simd-threaded.asyncify.wasm.gz | tr -d ' ') bytes gzipped"
+for build in ort-wasm-simd-threaded.asyncify ort-wasm-simd-threaded.jsep ort-wasm-simd-threaded; do
+  cp "$ort/$build.mjs" static/ort/
+  if [ ! -f "static/ort/$build.wasm.gz" ] || [ "$ort/$build.wasm" -nt "static/ort/$build.wasm.gz" ]; then
+    gzip -9 -c "$ort/$build.wasm" > "static/ort/$build.wasm.gz"
+  fi
+  echo "$build: $(wc -c < "static/ort/$build.wasm.gz" | tr -d ' ') bytes gzipped"
+done

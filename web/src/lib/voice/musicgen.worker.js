@@ -1,16 +1,22 @@
-// MusicGen (small) in the browser, on onnxruntime-web with WebGPU. A port of crates/infer/src/musicgen: the same ONNX
+// MusicGen (small) in the browser, on onnxruntime-web: on the GPU through WebGPU where the browser's WebGPU works with
+// it, otherwise on the CPU (multithreaded when the page is cross-origin isolated). Firefox takes the CPU path:
+// onnxruntime-web's WebGPU build fails there with a wasm memory fault. A port of crates/infer/src/musicgen: the same ONNX
 // files, the same delay pattern, classifier-free guidance, top-k sampling, continuation with a batched replay of the
 // overlap, and cancellation. After generating, it finds the segment's rejoin point and tempo with the Rust core
 // (static/wasm/driftscape.wasm), so the live engine needs no heavy work on the main thread.
 //
-// Messages in:  { type: "load" }
+// Messages in:  { type: "load", backend: "webgpu" | "webgpu-js" | "cpu" }
 //               { type: "generate", id, request }   (see voice.js for the request and result shapes)
 //               { type: "cancel", id }
 // Messages out: { type: "loading", detail, fraction } · { type: "ready" } · { type: "error", id?, message }
 //               { type: "progress", id, step, total } · { type: "result", id, ... } · { type: "cancelled", id }
 
-import * as ort from "onnxruntime-web/webgpu";
+let ort; // the onnxruntime-web build for the chosen backend, imported in load()
+let backend = "webgpu";
 import { Tokenizer } from "./tokenizer.js";
+// Greedy MusicGen output for a fixed prompt from the native engine (crates/infer/examples/greedy.rs --json): the tokens
+// and the decoded audio's level and zero-crossing rate. The self-check at load compares against it.
+import REFERENCE from "./selfcheck.reference.json";
 
 const REPO = "https://huggingface.co/Xenova/musicgen-small/resolve/main/";
 const FILES = {
@@ -80,10 +86,18 @@ async function fetchCached(url, onBytes) {
 }
 
 async function loadRuntime() {
-  // The 28 MB runtime ships gzipped (Cloudflare Pages caps files at 25 MiB); unpack it here.
+  // Each runtime ships gzipped (the WebGPU one is 28 MB; Cloudflare Pages caps files at 25 MiB); unpack it here.
   // Some servers mark .gz files as Content-Encoding: gzip, so the browser has already unpacked them; look at the bytes
   // instead of trusting the name: gzip starts 1f 8b, wasm starts \0asm.
-  const res = await fetch("/ort/ort-wasm-simd-threaded.asyncify.wasm.gz");
+  // webgpu: the native WebGPU implementation; webgpu-js: the JavaScript one (the package's default build); cpu: no GPU.
+  const builds = {
+    webgpu: ["ort-wasm-simd-threaded.asyncify", () => import("onnxruntime-web/webgpu")],
+    "webgpu-js": ["ort-wasm-simd-threaded.jsep", () => import("onnxruntime-web")],
+    cpu: ["ort-wasm-simd-threaded", () => import("onnxruntime-web/wasm")],
+  };
+  const [file, importer] = builds[backend];
+  ort = await importer();
+  const res = await fetch(`/ort/${file}.wasm.gz`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const bytes = await res.arrayBuffer();
   const head = new Uint8Array(bytes, 0, 2);
@@ -92,7 +106,9 @@ async function loadRuntime() {
     ? await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer()
     : bytes;
   ort.env.wasm.wasmPaths = "/ort/";
-  ort.env.wasm.numThreads = 1; // the GPU does the work; threads would need cross-origin isolation
+  // On the GPU, one thread is enough. On the CPU, use the cores, which needs cross-origin isolation (SharedArrayBuffer).
+  ort.env.wasm.numThreads =
+    backend === "cpu" && self.crossOriginIsolated ? Math.max(1, Math.min(8, (navigator.hardwareConcurrency || 4) - 1)) : 1;
 }
 
 async function loadCore() {
@@ -102,9 +118,6 @@ async function loadCore() {
 }
 
 async function load() {
-  if (!("gpu" in navigator) || !(await navigator.gpu.requestAdapter())) {
-    throw new Error("this browser has no WebGPU; try a recent Chrome, Edge or Safari, or run `driftscape serve`");
-  }
   post({ type: "loading", detail: "Preparing the engine", fraction: 0 });
   const [, core] = await Promise.all([step("loading the ONNX runtime", loadRuntime), step("loading the core", loadCore)]);
 
@@ -128,28 +141,66 @@ async function load() {
   );
   const files = Object.fromEntries(names.map((n, i) => [n, buffers[i]]));
 
-  post({ type: "loading", detail: "Starting the model on your GPU", fraction: 1 });
+  const gpu = backend !== "cpu";
+  post({ type: "loading", detail: gpu ? "Starting the model on your GPU" : "Starting the model", fraction: 1 });
   const tokenizer = new Tokenizer(JSON.parse(new TextDecoder().decode(files.tokenizer)));
-  const options = { executionProviders: ["webgpu"] };
+  const options = { executionProviders: [gpu ? "webgpu" : "wasm"] };
   // The decoder's caches stay on the GPU between steps; only the logits come back.
   const cacheOutputs = {};
   for (let l = 0; l < LAYERS; l++)
     for (const part of ["decoder.key", "decoder.value", "encoder.key", "encoder.value"])
       cacheOutputs[`present.${l}.${part}`] = "gpu-buffer";
   // One at a time: onnxruntime-web refuses to create two WebGPU sessions concurrently.
-  const [text, decoder, codec] = await step("starting the model", async () => [
+  let [text, decoder, codec] = await step("starting the model", async () => [
     await ort.InferenceSession.create(files.text, options),
-    await ort.InferenceSession.create(files.decoder, { ...options, preferredOutputLocation: cacheOutputs }),
+    await ort.InferenceSession.create(files.decoder, gpu ? { ...options, preferredOutputLocation: cacheOutputs } : options),
     await ort.InferenceSession.create(files.codec, options),
   ]);
   model = { tokenizer, text, decoder, codec, core };
 
-  // Warm up: the first run on WebGPU compiles the GPU programs, which can take a long time. Do it now, during loading,
-  // so pressing play doesn't pay for it: a fresh clip, then a continuation of it (the batched replay uses other shapes).
-  post({ type: "loading", detail: "Warming up the engine", fraction: 1 });
-  const warm = { prompt: "ambient pads", seconds: 0.4, guidance: 3, temperature: 1, topK: 50, seed: 1, continueFrom: null };
-  const first = await step("warming up", () => generate(-1, warm));
-  await step("warming up", () => generate(-1, { ...warm, continueFrom: first.codebooks.map((c) => c.slice(-10)) }));
+  // Self-check, which also warms up the GPU (the first run compiles its programs). A browser's GPU stack can run the
+  // model and still compute it wrongly: onnxruntime-web's JavaScript WebGPU implementation decodes EnCodec into
+  // something that isn't music. So check against the native engine's output and route around what's broken.
+  post({ type: "loading", detail: "Checking the engine", fraction: 1 });
+  // 1. The audio decoder: decode the reference tokens and compare the sound with the native decode of the same tokens.
+  if (!(await step("checking the audio decoder", codecMatches))) {
+    if (!gpu) throw new Error("self-check failed: the audio decoder doesn't match the reference");
+    post({ type: "loading", detail: "Checking the engine (audio decoding on the CPU)", fraction: 1 });
+    model.codec = codec = await ort.InferenceSession.create(files.codec, { executionProviders: ["wasm"] });
+    if (!(await step("checking the audio decoder", codecMatches))) {
+      throw new Error("self-check failed: the audio decoder doesn't match the reference");
+    }
+  }
+  // 2. The music decoder: greedy decoding of the reference prompt must open with the reference tokens.
+  const first = await step("checking the music decoder", () =>
+    generate(-1, { prompt: REFERENCE.prompt, seconds: 1, guidance: 3, temperature: 1, topK: 1, seed: 1, continueFrom: null }),
+  );
+  if (first.codebooks[0][0] !== REFERENCE.codebooks[0][0] || first.codebooks[0][1] !== REFERENCE.codebooks[0][1]) {
+    throw new Error("self-check failed: the music decoder doesn't match the reference");
+  }
+  // 3. Warm up the batched replay that continuations use (other shapes, other GPU programs).
+  await step("warming up", () =>
+    generate(-1, { prompt: REFERENCE.prompt, seconds: 0.4, guidance: 3, temperature: 1, topK: 50, seed: 1, continueFrom: first.codebooks.map((c) => c.slice(-10)) }),
+  );
+}
+
+/** Whether decoding the reference tokens sounds like the native engine's decode of them (level and zero crossings). */
+async function codecMatches() {
+  const frames = REFERENCE.codebooks[0].length;
+  const codes = BigInt64Array.from(REFERENCE.codebooks.flat(), (v) => BigInt(v));
+  const out = await model.codec.run({ audio_codes: new ort.Tensor("int64", codes, [1, 1, CODEBOOKS, frames]) });
+  const { rms, zcr } = stats(out.audio_values.data);
+  return Math.abs(rms - REFERENCE.rms) / REFERENCE.rms < 0.15 && Math.abs(zcr - REFERENCE.zcr) / REFERENCE.zcr < 0.25;
+}
+
+function stats(x) {
+  let sum = 0;
+  let crossings = 0;
+  for (let i = 0; i < x.length; i++) {
+    sum += x[i] * x[i];
+    if (i && (x[i] < 0) !== (x[i - 1] < 0)) crossings++;
+  }
+  return { rms: Math.sqrt(sum / x.length), zcr: crossings / x.length };
 }
 
 // ---- generation ----------------------------------------------------------------------------------------------------
@@ -331,11 +382,22 @@ function post(message, transfer = []) {
 
 self.onmessage = async ({ data }) => {
   if (data.type === "load") {
+    backend = data.backend ?? "webgpu";
     try {
       await load();
       post({ type: "ready" });
     } catch (e) {
       post({ type: "error", message: e.message ?? String(e) });
+    }
+  } else if (data.type === "selftest") {
+    // Greedy decoding of a fixed prompt, as crates/infer/examples/greedy.rs does natively: matching tokens mean this
+    // backend computes the same model. Also a zero-crossing rate: about 0.03 for music, about 0.5 for noise.
+    try {
+      const out = await generate(-2, { prompt: "warm ambient pads, soft piano", seconds: 1, guidance: 3, temperature: 1, topK: 1, seed: 1, continueFrom: null });
+      const { rms, zcr } = stats(out.audio);
+      post({ type: "selftest", backend, codebooks: out.codebooks.map((c) => c.slice(0, 12)), rms, zcr });
+    } catch (e) {
+      post({ type: "selftest", backend, error: e.message ?? String(e) });
     }
   } else if (data.type === "cancel") {
     if (current === data.id) cancelled.add(data.id);
