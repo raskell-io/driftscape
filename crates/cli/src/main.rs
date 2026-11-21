@@ -1,5 +1,6 @@
 //! `driftscape`: the command-line way into the engine.
 
+mod generate;
 mod play;
 
 use anyhow::{Context, Result, bail};
@@ -22,6 +23,26 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Generate a clip from a text prompt, on this machine.
+    Gen {
+        /// What it should sound like.
+        prompt: String,
+        /// Where to write the clip.
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Length in seconds (up to 30).
+        #[arg(long, default_value_t = 10.0)]
+        seconds: f32,
+        /// Random seed. The same seed and prompt give the same clip.
+        #[arg(long)]
+        seed: Option<u64>,
+        /// How strongly to follow the prompt.
+        #[arg(long, default_value_t = 3.0)]
+        guidance: f32,
+        /// Run the model on the GPU or the CPU.
+        #[arg(long, value_enum, default_value_t = Device::Gpu)]
+        device: Device,
+    },
     /// Turn an audio clip into a seamless loop.
     ///
     /// With --bars the loop is a whole number of bars at the clip's tempo (detected, or given with --bpm).
@@ -58,6 +79,21 @@ enum Command {
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
+enum Device {
+    Gpu,
+    Cpu,
+}
+
+impl From<Device> for driftscape_infer::musicgen::Backend {
+    fn from(d: Device) -> Self {
+        match d {
+            Device::Gpu => Self::Gpu,
+            Device::Cpu => Self::Cpu,
+        }
+    }
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
 enum Format {
     Pcm16,
     Pcm24,
@@ -76,6 +112,12 @@ impl From<Format> for SampleFormat {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::Gen { prompt, output, seconds, seed, guidance, device } => {
+            let seed = seed.unwrap_or_else(|| {
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64)
+            });
+            generate::run(&prompt, seconds, seed, guidance, device.into(), &output)?;
+        }
         Command::Loop { input, output, bars, bpm, seconds, crossfade_ms, rate, format } => {
             let clip = read(&input)?;
             let crossfade = crossfade_ms / 1000.0;
@@ -137,7 +179,7 @@ fn read(path: &Path) -> Result<Audio> {
     wav::decode(&bytes).with_context(|| format!("decoding {}", path.display()))
 }
 
-fn write(path: &Path, audio: &Audio, format: SampleFormat) -> Result<()> {
+pub(crate) fn write(path: &Path, audio: &Audio, format: SampleFormat) -> Result<()> {
     std::fs::write(path, wav::encode(audio, format)).with_context(|| format!("writing {}", path.display()))
 }
 

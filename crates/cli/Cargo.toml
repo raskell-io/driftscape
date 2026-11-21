@@ -13,4 +13,11 @@ path = "src/main.rs"
 anyhow = "1.0.104"
 clap = { version = "4.6.9", features = ["derive"] }
 cpal = "0.18.2"
+dirs = "7.0.0"
 driftscape-core = { path = "../core" }
+driftscape-infer = { version = "0.1.0", path = "../infer" }
+ort = "2.0.0-rc.15"
+
+# On macOS the decoder runs on the GPU through Metal.
+[target.'cfg(target_os = "macos")'.dependencies]
+driftscape-infer = { path = "../infer", features = ["metal"] }

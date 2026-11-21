@@ -1,0 +1,18 @@
+[package]
+name = "driftscape-infer"
+description = "Driftscape voices: native model inference (MusicGen via ONNX Runtime)."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+candle-core = "0.11.1"
+candle-nn = "0.11.1"
+driftscape-core = { path = "../core" }
+ort = "2.0.0-rc.15"
+tokenizers = "0.23.2"
+
+[features]
+# Run the candle decoder on the Mac GPU.
+metal = ["candle-core/metal", "candle-nn/metal"]
