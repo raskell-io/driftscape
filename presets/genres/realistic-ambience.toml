@@ -1,5 +1,6 @@
-# Realistic ambience: places as they sound. MusicGen is trained on music, so this genre leans musical until a
-# sound-effects voice (Stable Audio Open) is added; the template asks for field-recording character to help.
+# Realistic ambience: places as they sound. MusicGen is trained on music, so the model's part leans musical; the
+# realism comes from a procedural bed under it (rain, wind, waves or fire, picked from the listener's words) until a
+# sound-effects voice (Stable Audio Open) is added.
 id = "realistic-ambience"
 name = "Realistic ambience"
 description = "Places as they sound: rain, caves, campfires, taverns."
@@ -12,3 +13,6 @@ temperature = 0.95
 segment_seconds = 12.0
 overlap_seconds = 3.0
 crossfade_seconds = 2.5
+# Pick the bed from the listener's words ("auto"), at its natural level (0 dB: a few dB under the music).
+bed = "auto"
+bed_db = 0.0

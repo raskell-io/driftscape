@@ -21,6 +21,9 @@ later a DAW plugin. Three modes:
 - **Radio**: stations, each a preset that keeps the music moving.
 - **Producer**: a rack of layers. Generate takes, extend them, arrange them on a timeline and export a WAV.
 
+Under the music can sit an ambience bed: rain, wind, waves or fire, synthesised on the spot (no model). Realistic
+ambience picks one from your words.
+
 ---
 
 ## Use
@@ -29,6 +32,8 @@ Driftscape runs on your own machine. On a Mac with Apple silicon it generates fa
 
 ```bash
 driftscape live "rain on a tin roof, soft guitar"     # endless, steer it by typing while it plays
+driftscape live --genre realistic-ambience "campfire by a lake"   # a fire bed under it; :bed waves to change
+driftscape live --bed rain --bed-level -6             # a bed under any genre
 driftscape live --genre ambient-techno                # ambient, synthetic-ambience, realistic-ambience, ambient-techno, thematic
 driftscape radio                                      # list stations
 driftscape radio deep-space --stop-after 45           # a station, with a sleep timer

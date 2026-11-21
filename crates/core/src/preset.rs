@@ -28,6 +28,13 @@ pub struct Genre {
     pub crossfade_seconds: f32,
     /// A fixed tempo for the whole session, for genres with a beat.
     pub bpm: Option<f32>,
+    /// A procedural ambience bed under the music ([`crate::ambience`]): a kind ("rain", "wind", "waves", "fire"), or
+    /// "auto" to pick one from the listener's words. None: no bed unless the listener adds one.
+    #[serde(default)]
+    pub bed: Option<String>,
+    /// The bed's gain in dB. At 0 it sits a few dB under the music.
+    #[serde(default)]
+    pub bed_db: Option<f32>,
 }
 
 impl Genre {
@@ -36,6 +43,15 @@ impl Genre {
         let listener = if listener.trim().is_empty() { &self.default_prompt } else { listener.trim() };
         let bpm = self.bpm.map_or_else(String::new, |b| format!("{b:.0}"));
         self.template.replace("{prompt}", listener).replace("{bpm}", &bpm)
+    }
+
+    /// The bed this genre puts under `listener`'s words, if any.
+    pub fn bed_for(&self, listener: &str) -> Option<crate::ambience::Kind> {
+        let words = if listener.trim().is_empty() { &self.default_prompt } else { listener };
+        match self.bed.as_deref()? {
+            "auto" => crate::ambience::suggest(words),
+            id => crate::ambience::Kind::from_id(id),
+        }
     }
 
     /// Frames per bar of 4/4 at `sample_rate`, for genres with a tempo.

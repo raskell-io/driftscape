@@ -1,5 +1,6 @@
-// The output stage, on the audio thread: a slow leveler with a soft limiter (a port of driftscape_core::mixer::Leveler;
-// see that file for why), and a tap that hands the leveled samples to the page while it records.
+// The output stage, on the audio thread: a slow leveler for the music (a port of driftscape_core::mixer::Leveler; see
+// that file for why), the ambience bed added around it in stereo (input 1, not leveled: its level is chosen), a soft
+// limiter, and a tap that hands the interleaved stereo output to the page while it records.
 
 const TARGET_RMS = 0.1;
 const SECONDS = 3;
@@ -26,22 +27,33 @@ class Output extends AudioWorkletProcessor {
   }
 
   process(inputs, outputs) {
-    const input = inputs[0];
-    const output = outputs[0];
-    if (!input.length) return true;
-    const mono = input[0];
-    const out = output[0];
+    const mono = inputs[0]?.[0];
+    const bed = inputs[1] ?? [];
+    const [left, right = left] = outputs[0];
+    const bedL = bed[0];
+    const bedR = bed[1] ?? bed[0];
     const floor = TARGET_RMS / (2 * MAX_GAIN);
-    for (let i = 0; i < mono.length; i++) {
-      const s = mono[i];
-      this.power = this.coef * this.power + (1 - this.coef) * s * s;
-      const rms = Math.max(Math.sqrt(this.power), floor);
-      const wanted = Math.min(Math.max(TARGET_RMS / rms, MIN_GAIN), MAX_GAIN);
-      this.gain = this.coef * this.gain + (1 - this.coef) * wanted;
-      out[i] = softLimit(s * this.gain);
+    for (let i = 0; i < left.length; i++) {
+      let s = 0;
+      if (mono) {
+        s = mono[i];
+        this.power = this.coef * this.power + (1 - this.coef) * s * s;
+        const rms = Math.max(Math.sqrt(this.power), floor);
+        const wanted = Math.min(Math.max(TARGET_RMS / rms, MIN_GAIN), MAX_GAIN);
+        this.gain = this.coef * this.gain + (1 - this.coef) * wanted;
+        s *= this.gain;
+      }
+      left[i] = softLimit(s + (bedL ? bedL[i] : 0));
+      if (right !== left) right[i] = softLimit(s + (bedR ? bedR[i] : 0));
     }
-    for (let c = 1; c < output.length; c++) output[c].set(out);
-    if (this.recording) this.port.postMessage(out.slice());
+    if (this.recording) {
+      const frames = new Float32Array(left.length * 2);
+      for (let i = 0; i < left.length; i++) {
+        frames[2 * i] = left[i];
+        frames[2 * i + 1] = right[i];
+      }
+      this.port.postMessage(frames, [frames.buffer]);
+    }
     return true;
   }
 }

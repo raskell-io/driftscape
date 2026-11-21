@@ -9,6 +9,7 @@
   import * as store from "#lib/store.js";
   import * as P from "#lib/producer/project.js";
   import { Mixdown, loadCore, stereoWav } from "#lib/producer/mixdown.js";
+  import { BEDS, bedLoop } from "#lib/bed.js";
   import Knob from "./Knob.svelte";
 
   /** @type {{ genres: any[], voice: () => any, ready: boolean, onclaim: () => void }} */
@@ -40,6 +41,9 @@
   const length = $derived(project ? P.projectSeconds(project) : 0);
   const laneSeconds = $derived(Math.max(60, Math.ceil((length + 20) / 10) * 10));
   const genreOf = (id) => genres.find((g) => g.id === id) ?? genres[0];
+  /** A layer whose "genre" is `bed:<id>` plays procedural ambience instead of the model. */
+  const bedOf = (track) => (track.genreId?.startsWith("bed:") ? track.genreId.slice(4) : null);
+  const BED_SECONDS = 30;
   const selection = $derived.by(() => {
     if (!project || !selected) return null;
     for (const track of project.tracks) {
@@ -173,6 +177,7 @@
   // ---- generating takes ------------------------------------------------------------------------------------------
 
   async function makeTake(track, what, continueFrom = null) {
+    if (bedOf(track)) return makeBedTake(track, what);
     const v = voice();
     if (!v || busy) return null;
     error = "";
@@ -205,6 +210,29 @@
     } finally {
       busy = null;
       abort = null;
+    }
+  }
+
+  /** A bed take: a seamless loop from the Rust core, made at once (no model). */
+  async function makeBedTake(track, what) {
+    if (busy) return null;
+    error = "";
+    busy = { trackId: track.id, fraction: 0.5, what };
+    try {
+      const kind = bedOf(track);
+      const channels = bedLoop(await loadCore(), kind, PREVIEW_RATE, BED_SECONDS);
+      const id = `take-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+      const take = { id, channels, sampleRate: PREVIEW_RATE, codebooks: null, continuedFrom: null, peaks: peaksOf(channels[0], PREVIEW_RATE) };
+      await store.saveTake(take);
+      mix.load(id, channels, take.sampleRate);
+      peaks[id] = take.peaks;
+      const name = BEDS.find((b) => b.id === kind)?.name ?? kind;
+      return { id, info: { seconds: BED_SECONDS, prompt: `${name} (procedural bed)`, genreId: track.genreId, overlapSeconds: 0 } };
+    } catch (e) {
+      error = e.message;
+      return null;
+    } finally {
+      busy = null;
     }
   }
 
@@ -250,6 +278,13 @@
   }
 
   async function extend({ track, clip }) {
+    if (bedOf(track)) {
+      // A bed has no tokens to continue: add another stretch of it, crossfaded on.
+      const made = await makeTake(track, "Extending");
+      if (made) selected = P.appendTake(project, track, made.id, made.info).id;
+      if (made) commit();
+      return;
+    }
     const take = await store.loadTake(clip.take);
     if (!take?.codebooks) {
       error = "This take can't be extended (its voice doesn't continue takes).";
@@ -427,19 +462,28 @@
           <div class="module">
             <div class="module-top">
               <select bind:value={track.genreId} onchange={commit} aria-label="Genre">
-                {#each genres as x (x.id)}<option value={x.id}>{x.name}</option>{/each}
+                <optgroup label="Music">
+                  {#each genres as x (x.id)}<option value={x.id}>{x.name}</option>{/each}
+                </optgroup>
+                <optgroup label="Ambience (no model)">
+                  {#each BEDS as b (b.id)}<option value={`bed:${b.id}`}>Bed · {b.name}</option>{/each}
+                </optgroup>
               </select>
               <button class="mini" class:on={track.mute} aria-pressed={track.mute} onclick={() => ((track.mute = !track.mute), commit())}>M</button>
               <button class="mini" onclick={() => removeLayer(track)} aria-label="Remove layer" disabled={busy?.trackId === track.id}>✕</button>
             </div>
-            <input class="mood" bind:value={track.prompt} onchange={commit} placeholder={g.default_prompt} autocomplete="off" aria-label="Mood" />
+            {#if bedOf(track)}
+              <p class="bed-note">Synthesised on this device, at once. Takes loop seamlessly.</p>
+            {:else}
+              <input class="mood" bind:value={track.prompt} onchange={commit} placeholder={g.default_prompt} autocomplete="off" aria-label="Mood" />
+            {/if}
             <div class="module-bottom">
               <Knob label="Gain" size={34} min={-24} max={6} bind:value={track.gainDb} format={(v) => `${v} dB`} onchange={commit} />
               <Knob label="Pan" size={34} min={-10} max={10} value={Math.round(track.pan * 10)} format={(v) => (v ? (v < 0 ? `L${-v}` : `R${v}`) : "C")} onchange={(v) => ((track.pan = v / 10), commit())} />
               {#if busy?.trackId === track.id}
                 <button class="pill take busy" onclick={cancel} title="Cancel">{busy.what} · {Math.round(busy.fraction * 100)} %</button>
               {:else}
-                <button class="pill take" onclick={() => newTake(track)} disabled={!ready || !!busy}>New take</button>
+                <button class="pill take" onclick={() => newTake(track)} disabled={(!ready && !bedOf(track)) || !!busy}>New take</button>
               {/if}
             </div>
           </div>
@@ -497,8 +541,8 @@
         <span class="label">Clip</span>
         <span class="what">{project.takes[s.clip.take]?.prompt}</span>
         <div class="actions">
-          <button class="pill" onclick={() => regenerate(s)} disabled={!ready || !!busy}>Regenerate</button>
-          <button class="pill" onclick={() => extend(s)} disabled={!ready || !!busy}>Extend</button>
+          <button class="pill" onclick={() => regenerate(s)} disabled={(!ready && !bedOf(s.track)) || !!busy}>Regenerate</button>
+          <button class="pill" onclick={() => extend(s)} disabled={(!ready && !bedOf(s.track)) || !!busy}>Extend</button>
           <button class="pill" onclick={() => duplicate(s)}>Duplicate</button>
           <span class="fades">
             Fade in <button class="mini" onclick={() => fade(s, "fadeIn", -0.25)}>−</button>{s.clip.fadeIn.toFixed(2)} s<button class="mini" onclick={() => fade(s, "fadeIn", 0.25)}>+</button>
@@ -545,6 +589,7 @@
     padding: 0.3rem 0.4rem; font: 600 12px var(--display); }
   .mood { background: #120f22; border: 1px solid var(--line); border-radius: 8px; padding: 0.35rem 0.5rem; font-size: 0.85rem; outline: 0; }
   .mood:focus { border-color: var(--accent); }
+  .bed-note { margin: 0; font-size: 0.78rem; line-height: 1.35; color: var(--muted); }
   .module-bottom { display: flex; align-items: center; gap: 10px; }
   .module-bottom :global(.knob) { gap: 3px; }
   .module-bottom :global(.name) { font-size: 8px; }

@@ -13,6 +13,8 @@
 
 import { CancelledError } from "./voice/voice.js";
 import { appendRecording, finishRecording, startRecording } from "./store.js";
+import { bedLoop } from "./bed.js";
+import { loadCore } from "./producer/mixdown.js";
 
 const URGENT_SECONDS = 6;
 const CHANGE_FADE = 3;
@@ -50,6 +52,8 @@ export class LiveEngine {
     this.playing = null; // { segment, buffer, start, offset, gain, source }
     this.abort = null;
     this.recording = null; // { id, pending: Int16Array[], pendingFrames, frames } while recording
+    this.bedChoice = null; // { id, db } wanted under the music
+    this.bed = null; // { id, db, source, gain } playing
   }
 
   /**
@@ -62,10 +66,13 @@ export class LiveEngine {
     await this.ctx.resume();
     if (!this.output) {
       await this.ctx.audioWorklet.addModule("/worklets/output.js");
-      this.output = new AudioWorkletNode(this.ctx, "driftscape-output", { outputChannelCount: [2] });
+      this.output = new AudioWorkletNode(this.ctx, "driftscape-output", { numberOfInputs: 2, outputChannelCount: [2] });
       this.output.port.onmessage = ({ data }) => this.#capture(data);
       this.bus = new GainNode(this.ctx, { gain: this.level ?? 1 });
-      this.bus.connect(this.output).connect(this.ctx.destination);
+      this.bus.connect(this.output, 0, 0).connect(this.ctx.destination);
+      // The bed goes in on the second input, past the music's leveler.
+      this.bedBus = new GainNode(this.ctx, { gain: this.level ?? 1, channelCount: 2, channelCountMode: "explicit" });
+      this.bedBus.connect(this.output, 0, 1);
       // For the visuals: how loud the output is right now.
       this.analyser = new AnalyserNode(this.ctx, { fftSize: 1024 });
       this.output.connect(this.analyser);
@@ -85,6 +92,7 @@ export class LiveEngine {
       start = { previous: resume.codebooks, number: resume.number };
     }
     this.segmentsMade = start.number;
+    this.#applyBed();
     this.onEvent({ type: "state", playing: true });
     this.#generateLoop(start).catch((e) => this.#fail(e));
     this.timer = setInterval(() => this.#tick(), TICK_MS);
@@ -102,6 +110,7 @@ export class LiveEngine {
     }
     for (const v of this.voices ?? []) v.source.stop(this.ctx.currentTime + 2);
     this.voices = [];
+    this.#fadeOutBed();
     this.playing = null;
     this.ready = null;
     this.onEvent({ type: "state", playing: false });
@@ -138,6 +147,55 @@ export class LiveEngine {
   setLevel(level) {
     this.level = level;
     if (this.bus) this.bus.gain.setTargetAtTime(level, this.ctx.currentTime, 0.1);
+    if (this.bedBus) this.bedBus.gain.setTargetAtTime(level, this.ctx.currentTime, 0.1);
+  }
+
+  // ---- the ambience bed --------------------------------------------------------------------------------------------
+  // A seamless loop from the Rust core (bed.js), repeated under the music while the session plays. Changing it
+  // crossfades over about a second and a half; the music isn't touched.
+
+  /** The bed under the music: { id: "rain" | "wind" | "waves" | "fire", db } or null. */
+  setBed(choice) {
+    this.bedChoice = choice;
+    if (this.running) this.#applyBed();
+  }
+
+  async #applyBed() {
+    const want = this.bedChoice;
+    const now = this.bed;
+    if (now && want && now.id === want.id) {
+      now.db = want.db;
+      now.gain.gain.setTargetAtTime(10 ** (want.db / 20), this.ctx.currentTime, 0.3);
+      return;
+    }
+    if (!now && !want) return;
+    this.#fadeOutBed();
+    if (!want) return;
+    const core = await loadCore();
+    // Another change may have come in while the core loaded.
+    if (this.bedChoice !== want || !this.running) return;
+    const [l, r] = bedLoop(core, want.id, this.ctx.sampleRate);
+    const buffer = new AudioBuffer({ length: l.length, sampleRate: this.ctx.sampleRate, numberOfChannels: 2 });
+    buffer.copyToChannel(l, 0);
+    buffer.copyToChannel(r, 1);
+    const source = new AudioBufferSourceNode(this.ctx, { buffer, loop: true });
+    const gain = new GainNode(this.ctx, { gain: 0 });
+    source.connect(gain).connect(this.bedBus);
+    const t = this.ctx.currentTime;
+    gain.gain.setTargetAtTime(10 ** (want.db / 20), t, 0.4);
+    // Start somewhere in the loop, so it doesn't always open the same way.
+    source.start(t, Math.random() * buffer.duration);
+    this.bed = { id: want.id, db: want.db, source, gain };
+  }
+
+  #fadeOutBed() {
+    const old = this.bed;
+    this.bed = null;
+    if (!old || !this.ctx) return;
+    const t = this.ctx.currentTime;
+    old.gain.gain.cancelScheduledValues(t);
+    old.gain.gain.setTargetAtTime(0, t, 0.4);
+    old.source.stop(t + 3);
   }
 
   // ---- recording ---------------------------------------------------------------------------------------------------
@@ -146,7 +204,7 @@ export class LiveEngine {
 
   async startRecording(label) {
     const sampleRate = this.ctx?.sampleRate ?? 48000;
-    const id = await startRecording({ sampleRate, label });
+    const id = await startRecording({ sampleRate, label, channels: 2 });
     this.recording = { id, pending: [], pendingFrames: 0, frames: 0, sampleRate };
     this.output?.port.postMessage({ type: "record", on: true });
     return id;
@@ -167,20 +225,21 @@ export class LiveEngine {
     return this.recording ? this.recording.frames / this.recording.sampleRate : 0;
   }
 
+  /** Interleaved stereo frames from the output worklet. */
   #capture(samples) {
     const rec = this.recording;
     if (!rec) return;
     const pcm = new Int16Array(samples.length);
     for (let i = 0; i < samples.length; i++) pcm[i] = Math.max(-1, Math.min(1, samples[i])) * 32767;
     rec.pending.push(pcm);
-    rec.pendingFrames += pcm.length;
-    rec.frames += pcm.length;
+    rec.pendingFrames += pcm.length / 2;
+    rec.frames += pcm.length / 2;
     if (rec.pendingFrames >= rec.sampleRate * 2) this.#flush(rec);
   }
 
   #flush(rec) {
     if (!rec.pendingFrames) return Promise.resolve();
-    const chunk = new Int16Array(rec.pendingFrames);
+    const chunk = new Int16Array(rec.pendingFrames * 2);
     let at = 0;
     for (const p of rec.pending) {
       chunk.set(p, at);

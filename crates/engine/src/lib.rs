@@ -19,6 +19,7 @@
 use anyhow::{Context, Result, bail};
 use driftscape_core::{
     Audio,
+    ambience::{self, Bed},
     looping::rejoin_point,
     mixer::{Buffer, Command, Leveler, Mixer},
     preset::{Genre, Station},
@@ -76,8 +77,28 @@ impl Params {
     }
 }
 
+/// The ambience bed under the music.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BedChoice {
+    pub kind: ambience::Kind,
+    /// Gain in dB; at 0 the bed sits a few dB under the music.
+    pub db: f32,
+    /// 0..=1: how much rain, wind, sea or fire.
+    pub intensity: f32,
+}
+
+impl BedChoice {
+    /// The bed a genre puts under the listener's words ([`Genre::bed_for`]), at the genre's level.
+    pub fn for_params(params: &Params) -> Option<BedChoice> {
+        let kind = params.genre.bed_for(&params.prompt)?;
+        Some(BedChoice { kind, db: params.genre.bed_db.unwrap_or(0.0), intensity: 0.6 })
+    }
+}
+
 pub struct Config {
     pub params: Params,
+    /// The ambience bed to start with.
+    pub bed: Option<BedChoice>,
     /// A station's prompts replace `params.prompt`, one after another.
     pub station: Option<Station>,
     pub backend: Backend,
@@ -158,6 +179,7 @@ const PEAK_LIMIT: f32 = 0.95;
 /// A running session. Dropping it stops it.
 pub struct Session {
     shared: Arc<Mutex<Shared>>,
+    bed: Mutex<(rtrb::Producer<Option<BedChoice>>, Option<BedChoice>)>,
     version: Arc<AtomicU64>,
     quit: Arc<AtomicBool>,
     events: mpsc::Receiver<Event>,
@@ -171,21 +193,102 @@ pub struct AudioSide {
     clock: Arc<AtomicU64>,
     mixer: Mixer,
     leveler: Leveler,
+    beds: BedMixer,
+    bed_changes: rtrb::Consumer<Option<BedChoice>>,
 }
 
 impl AudioSide {
-    /// Fill `out` with the next mono samples and advance the clock by its length. Real-time safe: no locks, no
-    /// allocation, no freeing (finished buffers go back to the control thread).
-    pub fn process(&mut self, out: &mut [f32]) {
+    /// Fill `left` and `right` (the same length) with the next stereo frames: the music in the middle, the bed around
+    /// it. Advances the clock by the block's length. Real-time safe: no locks, no allocation, no freeing (finished
+    /// buffers go back to the control thread).
+    pub fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
         while let Ok(command) = self.commands.pop() {
             self.mixer.apply(command);
         }
-        self.mixer.render(out);
-        self.leveler.process(out);
+        while let Ok(change) = self.bed_changes.pop() {
+            self.beds.change(change);
+        }
+        self.mixer.render(left);
+        self.leveler.process(left);
+        right.copy_from_slice(left);
+        self.beds.add(left, right);
         for buffer in self.mixer.take_finished() {
             let _ = self.finished.push(buffer);
         }
         self.clock.store(self.mixer.time(), Ordering::Release);
+    }
+}
+
+/// The bed's scratch size; [`AudioSide::process`] works through longer blocks in pieces of this.
+pub const MAX_BLOCK: usize = 2048;
+
+/// Up to two beds: the current one, and the one it replaced, fading out. Beds hold no heap memory, so making and
+/// dropping them in the audio callback is real-time safe.
+struct BedMixer {
+    rate: u32,
+    seed: u64,
+    slots: [Option<BedSlot>; 2],
+    scratch: [Box<[f32; MAX_BLOCK]>; 2],
+}
+
+struct BedSlot {
+    bed: Bed,
+    gain: f32,
+    target: f32,
+    /// Per-sample smoothing towards `target` (about half a second).
+    coef: f32,
+}
+
+impl BedMixer {
+    fn new(rate: u32, seed: u64, initial: Option<BedChoice>) -> Self {
+        let scratch = [Box::new([0.0; MAX_BLOCK]), Box::new([0.0; MAX_BLOCK])];
+        let mut m = BedMixer { rate, seed, slots: [None, None], scratch };
+        m.change(initial);
+        m
+    }
+
+    fn change(&mut self, choice: Option<BedChoice>) {
+        let coef = 1.0 - (-1.0 / (0.5 * self.rate as f32)).exp();
+        match (self.slots[0].as_mut(), choice) {
+            // Same kind: just a new level and intensity.
+            (Some(slot), Some(c)) if slot.bed.kind() == c.kind => {
+                slot.target = 10f32.powf(c.db / 20.0);
+                slot.bed.set_intensity(c.intensity);
+            }
+            _ => {
+                // Fade the current one out (replacing any older one still fading) and bring the new one in.
+                let mut old = self.slots[0].take();
+                if let Some(o) = old.as_mut() {
+                    o.target = 0.0;
+                }
+                self.slots[1] = old;
+                if let Some(c) = choice {
+                    self.seed = self.seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    let mut bed = Bed::new(c.kind, self.rate, self.seed);
+                    bed.set_intensity(c.intensity);
+                    self.slots[0] = Some(BedSlot { bed, gain: 0.0, target: 10f32.powf(c.db / 20.0), coef });
+                }
+            }
+        }
+    }
+
+    fn add(&mut self, left: &mut [f32], right: &mut [f32]) {
+        for (l_block, r_block) in left.chunks_mut(MAX_BLOCK).zip(right.chunks_mut(MAX_BLOCK)) {
+            let n = l_block.len();
+            for slot in self.slots.iter_mut().flatten() {
+                let [bl, br] = &mut self.scratch;
+                let (bl, br) = (&mut bl[..n], &mut br[..n]);
+                slot.bed.fill(bl, br);
+                for i in 0..n {
+                    slot.gain += slot.coef * (slot.target - slot.gain);
+                    l_block[i] += bl[i] * slot.gain;
+                    r_block[i] += br[i] * slot.gain;
+                }
+            }
+        }
+        if self.slots[1].as_ref().is_some_and(|s| s.target == 0.0 && s.gain < 1e-3) {
+            self.slots[1] = None;
+        }
     }
 }
 
@@ -216,6 +319,9 @@ impl Session {
 
         let (command_tx, commands) = rtrb::RingBuffer::<Command>::new(64);
         let (finished, finished_rx) = rtrb::RingBuffer::<Buffer>::new(64);
+        let (bed_tx, bed_changes) = rtrb::RingBuffer::<Option<BedChoice>>::new(16);
+        let seed =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
 
         let generator = {
             let (shared, version, quit, events) = (shared.clone(), version.clone(), quit.clone(), event_tx.clone());
@@ -231,9 +337,17 @@ impl Session {
                 .spawn(move || control_loop(rate, shared, quit, clock, command_tx, finished_rx, event_tx))?
         };
 
-        let audio =
-            AudioSide { commands, finished, clock, mixer: Mixer::new(), leveler: Leveler::new(rate, TARGET_RMS, 3.0) };
-        Ok((Session { shared, version, quit, events, threads: vec![generator, control] }, audio))
+        let audio = AudioSide {
+            commands,
+            finished,
+            clock,
+            mixer: Mixer::new(),
+            leveler: Leveler::new(rate, TARGET_RMS, 3.0),
+            beds: BedMixer::new(rate, seed, config.bed),
+            bed_changes,
+        };
+        let bed = Mutex::new((bed_tx, config.bed));
+        Ok((Session { shared, bed, version, quit, events, threads: vec![generator, control] }, audio))
     }
 
     pub fn params(&self) -> Params {
@@ -252,6 +366,18 @@ impl Session {
         s.ready = None;
         self.version.fetch_add(1, Ordering::AcqRel);
         true
+    }
+
+    /// Change the bed under the music (or remove it): it crossfades over about a second. The music isn't touched.
+    pub fn set_bed(&self, choice: Option<BedChoice>) {
+        let mut bed = self.bed.lock().unwrap();
+        if bed.1 != choice && bed.0.push(choice).is_ok() {
+            bed.1 = choice;
+        }
+    }
+
+    pub fn bed(&self) -> Option<BedChoice> {
+        self.bed.lock().unwrap().1
     }
 
     /// The next event, if one is waiting.
@@ -582,4 +708,45 @@ pub fn listener_or_default<'a>(listener: &'a str, genre: &'a Genre) -> &'a str {
 
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n { s.to_owned() } else { format!("{}…", s.chars().take(n - 1).collect::<String>()) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use driftscape_core::ambience::Kind;
+
+    fn choice(kind: Kind) -> Option<BedChoice> {
+        Some(BedChoice { kind, db: 0.0, intensity: 0.6 })
+    }
+
+    #[test]
+    fn beds_crossfade_without_clicks_and_fade_out_when_removed() {
+        let rate = 32_000;
+        let mut m = BedMixer::new(rate, 1, choice(Kind::Rain));
+        let block = 300; // not a divisor of MAX_BLOCK, on purpose
+        let mut out = Vec::new();
+        let run = |m: &mut BedMixer, out: &mut Vec<f32>, seconds: f32| {
+            for _ in 0..(seconds * rate as f32) as usize / block {
+                let (mut l, mut r) = (vec![0.0; block], vec![0.0; block]);
+                m.add(&mut l, &mut r);
+                out.extend_from_slice(&l);
+            }
+        };
+        run(&mut m, &mut out, 2.0);
+        let switch = out.len();
+        m.change(choice(Kind::Wind));
+        run(&mut m, &mut out, 4.0);
+        assert!(m.slots[1].is_none(), "the old bed is dropped once it has faded out");
+        // The bed's own largest step, before the change, bounds the steps around it: a click would exceed it.
+        let step = |s: &[f32]| s.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+        let before = step(&out[rate as usize..switch]);
+        let around = step(&out[switch..switch + rate as usize / 10]);
+        assert!(around < before * 1.5, "switching steps {around} vs {before} before");
+
+        m.change(None);
+        let quiet_from = out.len() + 3 * rate as usize;
+        run(&mut m, &mut out, 4.0);
+        let tail = &out[quiet_from..];
+        assert!(tail.iter().all(|s| s.abs() < 1e-3), "silent once removed");
+    }
 }

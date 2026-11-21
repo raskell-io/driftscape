@@ -11,7 +11,8 @@ The Phoenix LiveView prototype lives on the `platform` branch.
 ```
 crates/core/   pure audio work: WAV, resampling, tempo, WSOLA time-stretch, seamless loops, tempo-fitted loops
                (fit_loop) and rejoin points, the real-time mixer and
-               leveler, genre/station presets, producer arrangements and their mixdown (arrange.rs).
+               leveler, genre/station presets, producer arrangements and their mixdown (arrange.rs), procedural
+               ambience beds (ambience.rs: rain, wind, waves, fire; `--example beds` measures levels, writes WAVs).
                No I/O, no model code, no threads.
 crates/infer/  voices. MusicGen: text encoder + EnCodec on ONNX Runtime (q4 files from Xenova/musicgen-small),
                decoder on candle/Metal (gpu.rs, facebook/musicgen-small safetensors) or ONNX on CPU (onnx.rs)
@@ -117,6 +118,18 @@ Models live in `~/Library/Application Support/Driftscape/models/musicgen-small/`
   `Curve::Linear` for aligned material, equal power for unrelated. Grid items need `minmax(0, 1fr)` columns, or the
   wide timeline stretches the instrument.
 - The app picks NativeVoice when `/api/health` answers `{"engine":"driftscape"}`, else WorkerVoice.
+
+## Ambience beds
+
+- Synthesised, not generated: noise through filters, struck resonators for drops and crackles, slow random drifts for
+  gusts and flicker, a 7–13 s swell for waves. Deterministic per seed and block size; allocation-free, so the engine
+  makes and drops them inside the audio callback. Trimmed to about -24 dBFS RMS at intensity 0.6.
+- Genres may name a bed (`bed = "rain"`) or `"auto"` (from the listener's words, `ambience::suggest`, ASCII stems:
+  Unicode case tables tripled the wasm). realistic-ambience uses auto. The bed never triggers regeneration: the engine
+  takes it through `Session::set_bed` (its own lock-free queue) and crossfades kinds over about a second.
+- Browser: the core renders a seamless loop (`render_loop`, equal-power crossfade of the tail into the start) that an
+  AudioBufferSourceNode repeats into the output worklet's second input (not leveled, but limited). Recordings are
+  stereo now (store keeps `channels`; old ones are mono). Producer layers set to `bed:<id>` make takes at once.
 
 ## Rules
 
