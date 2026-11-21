@@ -1,0 +1,17 @@
+[package]
+name = "driftscape-plugin"
+description = "Driftscape as a DAW instrument (CLAP; VST3 and AU through clap-wrapper)."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+driftscape-core = { path = "../core" }
+driftscape-engine = { path = "../engine" }
+# No default features: they include nih-plug's own VST3 export, whose bindings are GPL. VST3 comes from clap-wrapper.
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", default-features = false }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git" }

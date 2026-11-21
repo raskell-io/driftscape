@@ -15,8 +15,13 @@ crates/core/   pure audio work: WAV, resampling, tempo, WSOLA time-stretch, seam
                No I/O, no model code, no threads.
 crates/infer/  voices. MusicGen: text encoder + EnCodec on ONNX Runtime (q4 files from Xenova/musicgen-small),
                decoder on candle/Metal (gpu.rs, facebook/musicgen-small safetensors) or ONNX on CPU (onnx.rs)
-crates/cli/    the `driftscape` binary: live, radio, gen, loop, render, play, info, serve. live.rs runs live and radio mode
-               (generator thread, control loop, audio callback, recorder thread).
+crates/engine/ the live session for any audio output: generator and control threads, and AudioSide::process for the
+               caller's audio callback (never locks or allocates). Events go out on a channel. `--example headless`
+               drives it without a device at real-time pace and reports gaps and the largest sample step.
+crates/cli/    the `driftscape` binary: live, radio, gen, loop, render, play, info, serve. live.rs plays the engine
+               through cpal, records, and turns typed lines into Session::update calls.
+crates/plugin/ the DAW instrument (nih-plug, CLAP only, egui editor). wrap/ builds VST3 and AUv2 around the CLAP with
+               clap-wrapper (CMake): `mise run plugin [-- --install]`; `auval -v aumu Drft Rskl` validates the AU.
 crates/wasm/   C ABI over core for the browser (rejoin, tempo, arr_* for the producer mixdown); no wasm-bindgen, no
                serde_json (the 64 KB budget): the arrangement goes in as arr_track/arr_clip calls
 presets/       genres/*.toml and stations/*.toml, compiled into core (preset.rs lists them)
@@ -28,7 +33,16 @@ web/           SvelteKit app (adapter-static, Svelte 5, #lib/* imports). lib/eng
 Models live in `~/Library/Application Support/Driftscape/models/musicgen-small/` (`onnx/`, `tokenizer.json`,
 `safetensors/model.safetensors`).
 
-Planned: `crates/plugin` (nih-plug CLAP, wrapped to VST3/AU with clap-wrapper), `web/` (SvelteKit, adapter-static).
+## Plugin notes
+
+- Plays while the host transport runs (or always with "Free run"); a stopped transport stops calling `process`, which
+  pauses the engine's clock. Genres with a beat ask for the host's tempo ("Follow tempo").
+- `process` never locks: parameter changes go to the engine through nih-plug's background task executor; the mood text
+  is applied from the editor thread. A new sample rate (initialize) restarts the session.
+- nih_plug has `default-features = false`: its default VST3 export uses GPL bindings. VST3 and AU come from
+  clap-wrapper v0.18.0 (MIT; VST3 SDK MIT, AudioUnitSDK Apache 2.0), each bundle embedding the CLAP in
+  Contents/PlugIns. The AU SDK needs CMAKE_CXX_STANDARD 17; the AU's generated Info.plist (AudioComponents) is copied
+  back after the Ninja build, which overwrites it. AU codes: manufacturer Rskl (raskell.io), subtype Drft.
 
 ## Live mode
 

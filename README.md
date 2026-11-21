@@ -53,6 +53,13 @@ The model files (MusicGen small) go in `~/Library/Application Support/Driftscape
 [facebook/musicgen-small](https://huggingface.co/facebook/musicgen-small) for the GPU. MusicGen's weights are licensed
 CC-BY-NC 4.0.
 
+### In a DAW
+
+`mise run plugin -- --install` builds Driftscape as a CLAP, VST3 and Audio Unit instrument and installs them in
+`~/Library/Audio/Plug-Ins`. It plays live mode in time with the session: it starts and stops with the transport and
+asks for the session's tempo for genres with a beat. Genre, focus, wander and level are automatable; the mood is typed
+in the plugin's window.
+
 ## Development
 
 ```bash

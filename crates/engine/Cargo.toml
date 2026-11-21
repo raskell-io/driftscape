@@ -1,0 +1,18 @@
+[package]
+name = "driftscape-engine"
+description = "Driftscape's live session: endless generation, played as it is made, for any audio output."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+dirs = "7.0.0"
+driftscape-core = { path = "../core" }
+driftscape-infer = { path = "../infer" }
+ort = "2.0.0-rc.15"
+rtrb = "0.4.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+driftscape-infer = { path = "../infer", features = ["metal"] }

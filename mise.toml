@@ -24,3 +24,7 @@ run = "cargo run --release -p driftscape -- serve"
 description = "Deploy a local build by hand (Cloudflare Pages normally builds main itself); needs `wrangler login`"
 depends = ["web"]
 run = "wrangler pages deploy web/build --project-name driftscape-raskell-io --branch main --commit-hash $(git rev-parse HEAD)"
+
+[tasks.plugin]
+description = "Build the DAW plugin (CLAP, VST3, AUv2) into target/bundled; `mise run plugin -- --install` installs it"
+run = "crates/plugin/wrap/build.sh"

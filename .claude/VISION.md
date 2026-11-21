@@ -54,7 +54,8 @@ for the model), the voice, and defaults for segment length, tempo, crossfade and
 4. Web: hosted PWA and `driftscape serve`.
 5. Producer mode: a rack of layers on a timeline; takes generated, regenerated, extended, trimmed, faded, exported
    (done in the web app; `driftscape render` mixes the same arrangement format).
-6. Plugin.
+6. Plugin: live mode as a CLAP instrument (nih-plug), wrapped to VST3 and AUv2 with clap-wrapper; the AU passes
+   auval. Next: try it in Logic and Ableton, then the producer rack inside the plugin (drag takes into the session).
 
 Later, maybe: location-aware playback (soundscapes tied to places) and a platform for sharing, as separate consumers of
 the engine.

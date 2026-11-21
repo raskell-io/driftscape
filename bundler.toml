@@ -1,0 +1,3 @@
+# Bundle names for `cargo xtask bundle` (nih-plug).
+[driftscape-plugin]
+name = "Driftscape"
