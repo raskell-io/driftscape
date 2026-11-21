@@ -56,6 +56,7 @@ struct GenerateResult {
     codebooks: Vec<Vec<i64>>,
     overlap_seconds: f32,
     rejoin: usize,
+    rejoins: Vec<usize>,
     bpm: f64,
     seconds: f32,
 }
@@ -170,33 +171,48 @@ fn generate(
     drop(voice);
 
     let overlap = (clip.overlap_seconds * SAMPLE_RATE as f32) as usize;
-    let (rejoin, bpm) = analyse(&clip.audio, overlap, &req.analysis);
+    let (rejoins, bpm) = analyse(&clip.audio, overlap, &req.analysis);
     let meta = GenerateResult {
         sample_rate: SAMPLE_RATE,
         codebooks: clip.tokens.codebooks,
         overlap_seconds: clip.overlap_seconds,
-        rejoin,
+        rejoin: rejoins[0],
+        rejoins,
         bpm,
         seconds: started.elapsed().as_secs_f32(),
     };
     Ok((meta, clip.audio.channels.into_iter().next().unwrap_or_default()))
 }
 
-/// The same analysis the in-browser voice does (web/src/lib/voice/musicgen.worker.js), natively.
-fn analyse(audio: &Audio, overlap: usize, analysis: &Analysis) -> (usize, f64) {
+/// The same analysis the in-browser voice does (web/src/lib/voice/musicgen.worker.js), natively: up to three rejoin
+/// points at least 8 s back where the segment allows, one per third of the range, and the tempo for genres with one.
+fn analyse(audio: &Audio, overlap: usize, analysis: &Analysis) -> (Vec<usize>, f64) {
     let samples = &audio.channels[0];
     let rate = SAMPLE_RATE as usize;
     let crossfade = ((analysis.crossfade_seconds * SAMPLE_RATE as f32) as usize).min(samples.len());
     let window = crossfade.min(rate / 2).max(1);
     let from = samples.len() - crossfade;
-    let latest = from.saturating_sub(4 * rate);
+    let latest = from.saturating_sub((8 * rate).min(from.saturating_sub(rate)));
     let bar = analysis.bpm.map(|b| (4.0 * 60.0 / f64::from(b) * rate as f64).round() as usize);
-    let rejoin = rejoin_point(samples, from, window, overlap.min(latest), latest, bar)
-        .or_else(|| rejoin_point(samples, from, window, 0, latest, None))
-        .map_or(overlap, |(s, _)| s);
+    let earliest = overlap.min(latest);
+    let mut rejoins: Vec<usize> = Vec::new();
+    for i in 0..3 {
+        let lo = earliest + (latest - earliest) * i / 3;
+        let hi = earliest + (latest - earliest) * (i + 1) / 3;
+        let found = rejoin_point(samples, from, window, lo, hi, bar)
+            .or_else(|| bar.and(rejoin_point(samples, from, window, lo, hi, None)));
+        if let Some((r, _)) = found
+            && rejoins.iter().all(|&x| x.abs_diff(r) > rate)
+        {
+            rejoins.push(r);
+        }
+    }
+    if rejoins.is_empty() {
+        rejoins.push(rejoin_point(samples, from, window, 0, latest, None).map_or(overlap, |(s, _)| s));
+    }
     let bpm = match analysis.bpm {
         Some(_) => tempo::estimate(samples, SAMPLE_RATE, tempo::Range::default()).map_or(0.0, |t| t.bpm),
         None => 0.0,
     };
-    (rejoin, bpm)
+    (rejoins, bpm)
 }

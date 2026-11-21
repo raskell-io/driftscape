@@ -78,7 +78,14 @@ Planned: `crates/plugin` (nih-plug CLAP, wrapped to VST3/AU with clap-wrapper), 
   the native decode (selfcheck.reference.json, from `--example greedy -- <dir> cpu --json`); if the audio decoder is
   wrong on the GPU, it moves to the CPU. Then greedy decoding must open with the reference tokens. Found: the jsep
   WebGPU build decodes EnCodec wrongly (same tokens, 3x the level, not music) while its decoder is right.
-- Never trust "it runs" for audio: check output against the native reference before calling a backend working.
+- fp16 (`?precision=f16`, Xenova's q4f16 files, two decoders) fails the self-check: wrong first token, degenerate
+  codebooks, integer overflow on continuation. Opt-in only; the default chain never downloads it.
+- In the browser generation runs ~0.45x real time (Chrome, M4), so about half of what plays is repeats. Repeats go back
+  >= 8 s where the segment allows, rotate through up to three rejoin points, and crossfade up to 4 s (never longer than
+  the audio before the rejoin point). Urgent short segments are only used when the measured speed keeps up (>= 0.9x);
+  otherwise segments stay full length (a short one just loops). `localStorage["driftscape-trace"] = 1` logs repeats.
+- Test with sound off: set the Level knob to 0 (settings in IndexedDB) and read the trace; never play audio unannounced.
+- - Never trust "it runs" for audio: check output against the native reference before calling a backend working.
 - - UI (chosen 2026-11-21; see the concept page https://claude.ai/artifact/5FKYXGJzmyuxeDDCmRGKmr): instruments, calm
   rather than skeuomorphic. Live = Terrain (web/src/lib/ui/Terrain.svelte, logic in terrain.js): genres are hills on a
   contour map, the dot's position gives a genre plus a blended second one (Genre.flavor words). Dragging steers urgently;

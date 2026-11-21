@@ -5,7 +5,7 @@
 // overlap, and cancellation. After generating, it finds the segment's rejoin point and tempo with the Rust core
 // (static/wasm/driftscape.wasm), so the live engine needs no heavy work on the main thread.
 //
-// Messages in:  { type: "load", backend: "webgpu" | "webgpu-js" | "cpu" }
+// Messages in:  { type: "load", backend: "webgpu" | "webgpu-js" | "cpu", precision: "q4" | "f16" }
 //               { type: "generate", id, request }   (see voice.js for the request and result shapes)
 //               { type: "cancel", id }
 // Messages out: { type: "loading", detail, fraction } · { type: "ready" } · { type: "error", id?, message }
@@ -13,17 +13,30 @@
 
 let ort; // the onnxruntime-web build for the chosen backend, imported in load()
 let backend = "webgpu";
+let precision = "q4";
+let skipCheck = false; // diagnostics only: load even if the music decoder check fails
 import { Tokenizer } from "./tokenizer.js";
 // Greedy MusicGen output for a fixed prompt from the native engine (crates/infer/examples/greedy.rs --json): the tokens
 // and the decoded audio's level and zero-crossing rate. The self-check at load compares against it.
 import REFERENCE from "./selfcheck.reference.json";
 
 const REPO = "https://huggingface.co/Xenova/musicgen-small/resolve/main/";
-const FILES = {
-  tokenizer: "tokenizer.json",
-  text: "onnx/text_encoder_q4.onnx",
-  decoder: "onnx/decoder_model_merged_q4.onnx",
-  codec: "onnx/encodec_decode_q4.onnx",
+// q4: 4-bit weights, float32 arithmetic, one merged decoder. f16: the same 4-bit weights with float16 arithmetic (faster
+// on GPUs with shader-f16), as two decoders: a first pass that takes many positions, and a cached step.
+const FILE_SETS = {
+  q4: {
+    tokenizer: "tokenizer.json",
+    text: "onnx/text_encoder_q4.onnx",
+    decoder: "onnx/decoder_model_merged_q4.onnx",
+    codec: "onnx/encodec_decode_q4.onnx",
+  },
+  f16: {
+    tokenizer: "tokenizer.json",
+    text: "onnx/text_encoder_q4f16.onnx",
+    decoder: "onnx/decoder_model_q4f16.onnx",
+    decoderPast: "onnx/decoder_with_past_model_q4f16.onnx",
+    codec: "onnx/encodec_decode_q4f16.onnx",
+  },
 };
 const MODEL_CACHE = "driftscape-models-v1";
 
@@ -122,6 +135,7 @@ async function load() {
   const [, core] = await Promise.all([step("loading the ONNX runtime", loadRuntime), step("loading the core", loadCore)]);
 
   // Download everything first (in parallel), with one combined progress figure.
+  const FILES = FILE_SETS[precision];
   const names = Object.keys(FILES);
   const progress = Object.fromEntries(names.map((n) => [n, { got: 0, total: 0 }]));
   const report = () => {
@@ -146,17 +160,22 @@ async function load() {
   const tokenizer = new Tokenizer(JSON.parse(new TextDecoder().decode(files.tokenizer)));
   const options = { executionProviders: [gpu ? "webgpu" : "wasm"] };
   // The decoder's caches stay on the GPU between steps; only the logits come back.
-  const cacheOutputs = {};
-  for (let l = 0; l < LAYERS; l++)
-    for (const part of ["decoder.key", "decoder.value", "encoder.key", "encoder.value"])
-      cacheOutputs[`present.${l}.${part}`] = "gpu-buffer";
+  const keepOnGpu = (names) => Object.fromEntries(names.filter((n) => n.startsWith("present.")).map((n) => [n, "gpu-buffer"]));
+  const decoderSession = async (file) => {
+    if (!gpu) return ort.InferenceSession.create(file, options);
+    const probe = await ort.InferenceSession.create(file, options);
+    const outputs = probe.outputNames;
+    await probe.release();
+    return ort.InferenceSession.create(file, { ...options, preferredOutputLocation: keepOnGpu(outputs) });
+  };
   // One at a time: onnxruntime-web refuses to create two WebGPU sessions concurrently.
-  let [text, decoder, codec] = await step("starting the model", async () => [
+  let [text, decoder, decoderPast, codec] = await step("starting the model", async () => [
     await ort.InferenceSession.create(files.text, options),
-    await ort.InferenceSession.create(files.decoder, gpu ? { ...options, preferredOutputLocation: cacheOutputs } : options),
+    await decoderSession(files.decoder),
+    files.decoderPast ? await decoderSession(files.decoderPast) : null,
     await ort.InferenceSession.create(files.codec, options),
   ]);
-  model = { tokenizer, text, decoder, codec, core };
+  model = { tokenizer, text, decoder, decoderPast, codec, core };
 
   // Self-check, which also warms up the GPU (the first run compiles its programs). A browser's GPU stack can run the
   // model and still compute it wrongly: onnxruntime-web's JavaScript WebGPU implementation decodes EnCodec into
@@ -175,7 +194,7 @@ async function load() {
   const first = await step("checking the music decoder", () =>
     generate(-1, { prompt: REFERENCE.prompt, seconds: 1, guidance: 3, temperature: 1, topK: 1, seed: 1, continueFrom: null }),
   );
-  if (first.codebooks[0][0] !== REFERENCE.codebooks[0][0] || first.codebooks[0][1] !== REFERENCE.codebooks[0][1]) {
+  if (!skipCheck && (first.codebooks[0][0] !== REFERENCE.codebooks[0][0] || first.codebooks[0][1] !== REFERENCE.codebooks[0][1])) {
     throw new Error("self-check failed: the music decoder doesn't match the reference");
   }
   // 3. Warm up the batched replay that continuations use (other shapes, other GPU programs).
@@ -245,7 +264,7 @@ function forcedToken(k, p, len, prefix) {
 const i64 = (values, dims) => new ort.Tensor("int64", BigInt64Array.from(values, (v) => BigInt(v)), dims);
 
 async function generate(id, req) {
-  const { tokenizer, text, decoder, codec } = model;
+  const { tokenizer, text, decoder, decoderPast, codec } = model;
   const prefix = req.continueFrom ?? null; // number[CODEBOOKS][frames]
   const prefixFrames = prefix ? prefix[0].length : 0;
   const newFrames = Math.round(req.seconds * FRAME_RATE);
@@ -278,18 +297,31 @@ async function generate(id, req) {
     // input_ids is [rows, positions]: transpose the per-position rows.
     const flat = new BigInt64Array(2 * CODEBOOKS * n);
     for (let t = 0; t < n; t++) for (let r = 0; r < 2 * CODEBOOKS; r++) flat[r * n + t] = positions[t][r];
-    const feeds = {
-      input_ids: new ort.Tensor("int64", flat, [2 * CODEBOOKS, n]),
-      encoder_hidden_states: statesT,
-      encoder_attention_mask: maskT,
-      use_cache_branch: new ort.Tensor("bool", [cache !== null], [1]),
-    };
-    for (let l = 0; l < LAYERS; l++)
-      for (const part of ["decoder.key", "decoder.value", "encoder.key", "encoder.value"]) {
-        const name = `past_key_values.${l}.${part}`;
-        feeds[name] = cache ? cache[name] : new ort.Tensor("float32", new Float32Array(0), [2, HEADS, 0, HEAD_DIM]);
+    const ids = new ort.Tensor("int64", flat, [2 * CODEBOOKS, n]);
+    let out;
+    if (decoderPast) {
+      // Two decoders: the first pass takes the text and every known position; later steps take the caches.
+      if (!cache) {
+        out = await decoder.run({ input_ids: ids, encoder_hidden_states: statesT, encoder_attention_mask: maskT });
+      } else {
+        const feeds = { input_ids: ids, encoder_attention_mask: maskT };
+        for (const [name, value] of Object.entries(cache)) feeds[name] = value;
+        out = await decoderPast.run(feeds);
       }
-    const out = await decoder.run(feeds);
+    } else {
+      const feeds = {
+        input_ids: ids,
+        encoder_hidden_states: statesT,
+        encoder_attention_mask: maskT,
+        use_cache_branch: new ort.Tensor("bool", [cache !== null], [1]),
+      };
+      for (let l = 0; l < LAYERS; l++)
+        for (const part of ["decoder.key", "decoder.value", "encoder.key", "encoder.value"]) {
+          const name = `past_key_values.${l}.${part}`;
+          feeds[name] = cache ? cache[name] : new ort.Tensor("float32", new Float32Array(0), [2, HEADS, 0, HEAD_DIM]);
+        }
+      out = await decoder.run(feeds);
+    }
     // Self-attention caches grow each step; cross-attention caches come from the first pass only (on cached passes
     // the merged decoder returns placeholders for them).
     const next = {};
@@ -299,7 +331,7 @@ async function generate(id, req) {
         const present = out[`present.${l}.${part}`];
         if (cache && part.startsWith("encoder")) {
           next[past] = cache[past];
-          present.dispose();
+          present?.dispose(); // the step decoder doesn't return cross-attention caches at all
         } else {
           next[past] = present;
           if (cache) cache[past].dispose();
@@ -366,12 +398,25 @@ function analyse(audio, overlap, analysis) {
   // Compare a short window at the seam: enough to match the sound, cheap enough for wasm.
   const window = Math.min(crossfade, SAMPLE_RATE / 2);
   const from = audio.length - crossfade;
-  const latest = Math.max(0, from - 4 * SAMPLE_RATE); // repeats at least 4 s long
+  // Repeats at least 8 s long where the segment allows it, so a repeat is a phrase returning, not a stutter.
+  const latest = Math.max(0, from - Math.min(8 * SAMPLE_RATE, Math.max(0, from - SAMPLE_RATE)));
   const bar = analysis.bpm ? Math.round(((4 * 60) / analysis.bpm) * SAMPLE_RATE) : 0;
-  let rejoin = Number(core.rejoin(from, window, Math.min(overlap, latest), latest, bar));
-  if (rejoin < 0) rejoin = Number(core.rejoin(from, window, 0, latest, 0));
+  // Up to three rejoin points, one per third of the allowed range, so successive repeats don't play the same loop.
+  const rejoins = [];
+  const earliest = Math.min(overlap, latest);
+  for (let i = 0; i < 3; i++) {
+    const lo = Math.round(earliest + ((latest - earliest) * i) / 3);
+    const hi = Math.round(earliest + ((latest - earliest) * (i + 1)) / 3);
+    let r = Number(core.rejoin(from, window, lo, hi, bar));
+    if (r < 0 && bar) r = Number(core.rejoin(from, window, lo, hi, 0));
+    if (r >= 0 && rejoins.every((x) => Math.abs(x - r) > SAMPLE_RATE)) rejoins.push(r);
+  }
+  if (!rejoins.length) {
+    const r = Number(core.rejoin(from, window, 0, latest, 0));
+    rejoins.push(r < 0 ? overlap : r);
+  }
   const bpm = analysis.bpm ? core.tempo(SAMPLE_RATE) : 0;
-  return { rejoin: rejoin < 0 ? overlap : rejoin, bpm };
+  return { rejoin: rejoins[0], rejoins, bpm };
 }
 
 // ---- messages ------------------------------------------------------------------------------------------------------
@@ -383,6 +428,8 @@ function post(message, transfer = []) {
 self.onmessage = async ({ data }) => {
   if (data.type === "load") {
     backend = data.backend ?? "webgpu";
+    precision = data.precision ?? "q4";
+    skipCheck = !!data.skipCheck;
     try {
       await load();
       post({ type: "ready" });
@@ -399,6 +446,21 @@ self.onmessage = async ({ data }) => {
     } catch (e) {
       post({ type: "selftest", backend, error: e.message ?? String(e) });
     }
+  } else if (data.type === "bench") {
+    // Silent speed test: generate `seconds` of new audio (and a continuation of it) and report seconds per second.
+    try {
+      const req = { prompt: "warm ambient pads, soft piano", seconds: data.seconds ?? 6, guidance: 3, temperature: 1, topK: 250, seed: 7, continueFrom: null };
+      let t = performance.now();
+      const a = await generate(-3, req);
+      const fresh = (performance.now() - t) / 1000;
+      t = performance.now();
+      await generate(-3, { ...req, continueFrom: a.codebooks.map((c) => c.slice(-150)) });
+      const cont = (performance.now() - t) / 1000;
+      const s = stats(a.audio);
+      post({ type: "bench", backend, precision, fresh: req.seconds / fresh, continued: req.seconds / cont, rms: s.rms, zcr: s.zcr });
+    } catch (e) {
+      post({ type: "bench", backend, precision, error: e.message ?? String(e) });
+    }
   } else if (data.type === "cancel") {
     if (current === data.id) cancelled.add(data.id);
   } else if (data.type === "generate") {
@@ -408,7 +470,7 @@ self.onmessage = async ({ data }) => {
     try {
       const { audio, codebooks, overlapSeconds } = await generate(id, request);
       const overlap = Math.round(overlapSeconds * SAMPLE_RATE);
-      const { rejoin, bpm } = analyse(audio, overlap, request.analysis);
+      const { rejoin, rejoins, bpm } = analyse(audio, overlap, request.analysis);
       post(
         {
           type: "result",
@@ -418,6 +480,7 @@ self.onmessage = async ({ data }) => {
           codebooks,
           overlapSeconds,
           rejoin,
+          rejoins,
           bpm,
           seconds: (performance.now() - started) / 1000,
         },

@@ -524,7 +524,8 @@ fn generate_loop(
 fn rejoin_for(audio: &Audio, genre: &Genre, rate: u32, overlap: usize, crossfade: usize) -> usize {
     let samples = &audio.channels[0];
     let from = samples.len() - crossfade;
-    let min_loop = 4 * rate as usize;
+    // Repeats at least 8 s long where the segment allows it, so a repeat is a phrase returning, not a stutter.
+    let min_loop = (8 * rate as usize).min(from.saturating_sub(rate as usize));
     let latest = from.saturating_sub(min_loop);
     let bar = genre.bpm.map(|requested| {
         // Prefer the tempo the model actually played, if it is close to the one asked for.

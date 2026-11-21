@@ -16,6 +16,8 @@ import { appendRecording, finishRecording, startRecording } from "./store.js";
 
 const URGENT_SECONDS = 6;
 const CHANGE_FADE = 3;
+// Repeats crossfade longer than transitions, so going back sounds like a phrase returning.
+const REPEAT_FADE = 4;
 const START_FADE = 0.5;
 // Background tabs run timers about once a second, so transitions are scheduled well ahead.
 const LOOKAHEAD = 1.5;
@@ -203,7 +205,11 @@ export class LiveEngine {
         ? this.station.prompts[Math.floor(number / Math.max(1, this.station.segments_per_prompt)) % this.station.prompts.length]
         : prompt;
       const urgent = v !== placedVersion || (number === 0 && !this.ready);
-      const seconds = urgent ? Math.min(g.segment_seconds, URGENT_SECONDS) : g.segment_seconds;
+      // A short urgent segment gets music (or a change) to the listener sooner, but only pays off when generation keeps
+      // up with playback. When it doesn't (in the browser, about half real time), a short segment just means repeating
+      // one short loop while the next is made; a full-length one gives longer phrases to come back to.
+      const keepsUp = (this.speed ?? (this.voice.fast ? 1.5 : 0.5)) >= 0.9;
+      const seconds = urgent && keepsUp ? Math.min(g.segment_seconds, URGENT_SECONDS) : g.segment_seconds;
       const frames = Math.round(g.overlap_seconds * 50);
       const request = {
         prompt: fill(g, listener, blend),
@@ -227,6 +233,9 @@ export class LiveEngine {
         throw e;
       }
       if (!this.running) return;
+      // How fast this voice generates, for sizing urgent segments (seconds of new audio per second).
+      const measured = seconds / result.seconds;
+      this.speed = this.speed === undefined ? measured : 0.5 * this.speed + 0.5 * measured;
       if (this.version !== v) {
         previous = this.playingTokens;
         continue;
@@ -252,6 +261,7 @@ export class LiveEngine {
         overlap: result.overlapSeconds,
         crossfade: Math.min(g.crossfade_seconds, Math.max(result.overlapSeconds, 1)),
         rejoin: result.rejoin / result.sampleRate,
+        rejoins: (result.rejoins ?? [result.rejoin]).map((r) => r / result.sampleRate),
         urgent,
         speed: seconds / result.seconds, // seconds of new audio per second of generation
         label: [
@@ -299,17 +309,34 @@ export class LiveEngine {
       return;
     }
     const fade = p.segment.crossfade;
-    const at = end - fade;
-    if (now + LOOKAHEAD < at) return;
-    this.#fadeOut(p, at, fade);
     if (this.ready) {
+      const at = end - fade;
+      if (now + LOOKAHEAD < at) return;
       // The new segment's (overlap - fade) sounds like the current one's (end - fade).
       const segment = this.#take();
+      this.#fadeOut(p, at, fade);
       this.#play(segment, at, Math.max(0, segment.overlap - fade), fade);
-    } else {
-      this.onEvent({ type: "repeat" });
-      this.#play(p.segment, at, p.segment.rejoin, fade, true);
+      return;
     }
+    // Nothing new yet: repeat, going back to the next of the segment's rejoin points in turn. A rejoin point sounds like
+    // the segment's last `fade` seconds, so the new voice must reach it when the old one reaches them (at end - fade).
+    // The repeat's crossfade is longer (REPEAT_FADE) and so starts earlier, but never longer than the audio that comes
+    // before the rejoin point, and never before the current voice has finished fading in.
+    const rejoins = p.segment.rejoins?.length ? p.segment.rejoins : [p.segment.rejoin];
+    const rejoin = rejoins[(p.repeats ?? 0) % rejoins.length];
+    const fadeLen = Math.max(fade, Math.min(REPEAT_FADE, rejoin + fade, end - fade - (p.start + p.fadeIn)));
+    const rat = end - fadeLen;
+    if (now + LOOKAHEAD < rat) return;
+    const offset = Math.max(0, rejoin - (fadeLen - fade));
+    this.onEvent({ type: "repeat" });
+    if (trace()) {
+      console.debug(
+        `[driftscape] repeat at ${rat.toFixed(2)} (now ${now.toFixed(2)}, voice started ${p.start.toFixed(2)}): back to ${rejoin.toFixed(1)} s of ${p.segment.buffer.duration.toFixed(1)} s, loop ${(p.segment.buffer.duration - fade - rejoin).toFixed(1)} s, crossfade ${fadeLen.toFixed(1)} s`,
+      );
+    }
+    this.#fadeOut(p, rat, fadeLen);
+    this.#play(p.segment, rat, offset, fadeLen, true);
+    this.playing.repeats = (p.repeats ?? 0) + 1;
   }
 
   #take() {
@@ -325,7 +352,7 @@ export class LiveEngine {
     source.connect(gain).connect(this.bus);
     gain.gain.setValueCurveAtTime(FADE_IN, at, fade);
     source.start(at, offset);
-    const voice = { segment, source, gain, start: at, offset };
+    const voice = { segment, source, gain, start: at, offset, fadeIn: fade };
     this.voices = [...(this.voices ?? []).filter((v) => !v.done), voice];
     source.onended = () => (voice.done = true);
     this.playing = voice;
@@ -345,6 +372,7 @@ export class LiveEngine {
       overlap: segment.overlap,
       crossfade: segment.crossfade,
       rejoin: segment.rejoin,
+      rejoins: segment.rejoins,
       // The genre and prompt, without this session's speed or a previous "resumed".
       label: segment.label.replace(/ · resumed$/, "").replace(/ · [\d.]+× real time/, ""),
       params: { genreId: genre.id, prompt, focus, variety, blendId: blend?.genre.id ?? null, blendShare: blend?.share ?? 0 },
@@ -377,4 +405,12 @@ export function fill(genre, listener, blend = null) {
 }
 
 const clamp = (x, lo, hi) => Math.min(Math.max(x, lo), hi);
+/** Debug output, on when localStorage has "driftscape-trace". */
+const trace = () => {
+  try {
+    return !!globalThis.localStorage?.getItem("driftscape-trace");
+  } catch {
+    return false;
+  }
+};
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

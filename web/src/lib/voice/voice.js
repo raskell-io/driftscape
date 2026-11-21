@@ -25,16 +25,17 @@ export class WorkerVoice {
   #next = 1;
   #ready;
   #onLoading;
-  #fellBack = false;
+  #attempts;
 
   /**
    * @param {(status: {detail: string, fraction: number}) => void} onLoading
-   * @param {"webgpu" | "webgpu-js" | "cpu"} backend
+   * @param {{backend: "webgpu" | "webgpu-js" | "cpu", precision: "q4" | "f16"}[]} attempts setups to try in order; a
+   *   failed load, a failed self-check or a crash moves on to the next
    */
-  constructor(onLoading, backend) {
+  constructor(onLoading, attempts) {
     this.#onLoading = onLoading;
-    this.backend = backend;
-    this.#ready = this.#start(backend).catch((e) => this.#fallBack(e));
+    this.#attempts = [...attempts];
+    this.#ready = this.#tryNext();
   }
 
   get label() {
@@ -45,10 +46,25 @@ export class WorkerVoice {
     return this.#ready;
   }
 
-  /** Start a worker on a backend; resolves when the model is loaded. */
-  #start(backend) {
+  /** Try the next setup, and the ones after it if it fails. */
+  async #tryNext(previous) {
+    const attempt = this.#attempts.shift();
+    if (!attempt) throw previous;
+    if (previous) {
+      this.#onLoading({ detail: attempt.backend === "cpu" ? "Switching to the CPU" : "Switching to a safer setting", fraction: 0 });
+    }
+    try {
+      await this.#start(attempt);
+    } catch (e) {
+      return this.#tryNext(e);
+    }
+  }
+
+  /** Start a worker on a setup; resolves when the model is loaded and has passed its self-check. */
+  #start({ backend, precision }) {
     this.#worker?.terminate();
     this.backend = backend;
+    this.precision = precision;
     const worker = new Worker(new URL("./musicgen.worker.js", import.meta.url), { type: "module" });
     this.#worker = worker;
     return new Promise((resolve, reject) => {
@@ -88,25 +104,17 @@ export class WorkerVoice {
         for (const job of this.#pending.values()) job.reject(error);
         this.#pending.clear();
       };
-      worker.postMessage({ type: "load", backend });
+      worker.postMessage({ type: "load", backend, precision });
     });
-  }
-
-  /** WebGPU didn't work here: carry on on the CPU, once. */
-  async #fallBack(error) {
-    if (this.backend === "cpu" || this.#fellBack) throw error;
-    this.#fellBack = true;
-    this.#onLoading({ detail: "Your browser's GPU didn't work with the engine; switching to the CPU", fraction: 0 });
-    await this.#start("cpu");
   }
 
   async generate(request, onProgress, signal) {
     try {
       return await this.#run(request, onProgress, signal);
     } catch (e) {
-      // A crash on the GPU path (Firefox's WebGPU, for one): switch to the CPU and try again.
-      if (!(e instanceof CancelledError) && this.backend !== "cpu" && !this.#fellBack && isCrash(e.message)) {
-        this.#ready = this.#fallBack(e);
+      // A crash mid-session (Firefox's WebGPU, for one): move on to the next setup and try again.
+      if (!(e instanceof CancelledError) && this.#attempts.length && isCrash(e.message)) {
+        this.#ready = this.#tryNext(e);
         await this.#ready;
         return this.#run(request, onProgress, signal);
       }
@@ -127,6 +135,7 @@ export class WorkerVoice {
 /** The native engine behind `driftscape serve`. */
 export class NativeVoice {
   label = "the Driftscape engine on this computer";
+  fast = true; // faster than real time on a recent Mac
 
   ready() {
     return Promise.resolve();
@@ -161,7 +170,7 @@ export class NativeVoice {
 /**
  * The native engine if this page is served by `driftscape serve`, otherwise the in-browser one: on the GPU where the
  * browser's WebGPU works with onnxruntime-web (in Firefox through its JavaScript WebGPU implementation), on the CPU
- * elsewhere. `?engine=cpu`, `?engine=gpu` or `?engine=jsep` in the address overrides the choice, for testing.
+ * elsewhere. `?engine=cpu|gpu|jsep` and `?precision=q4|f16` in the address force a setup, for testing.
  */
 export async function chooseVoice(onLoading) {
   const forced = new URLSearchParams(location.search).get("engine");
@@ -171,15 +180,21 @@ export async function chooseVoice(onLoading) {
   } catch {
     // no native engine here
   }
+  const params = new URLSearchParams(location.search);
+  const adapter = "gpu" in navigator ? await navigator.gpu.requestAdapter().catch(() => null) : null;
+  // Firefox: onnxruntime-web's native WebGPU implementation crashes there, so try its JavaScript one. Everywhere else:
+  // native WebGPU when there is an adapter. Then the CPU.
   let backend = { cpu: "cpu", gpu: "webgpu", jsep: "webgpu-js" }[forced] ?? null;
-  if (!backend) {
-    // Firefox: onnxruntime-web's native WebGPU implementation crashes there, so try its JavaScript one (falling back to
-    // the CPU if that crashes too). Everywhere else: native WebGPU when there is an adapter, else the CPU.
-    const firefox = /firefox/i.test(navigator.userAgent);
-    const adapter = "gpu" in navigator ? await navigator.gpu.requestAdapter().catch(() => null) : null;
-    backend = !adapter ? "cpu" : firefox ? "webgpu-js" : "webgpu";
-  }
-  return new WorkerVoice(onLoading, backend);
+  if (!backend) backend = !adapter ? "cpu" : /firefox/i.test(navigator.userAgent) ? "webgpu-js" : "webgpu";
+  // Float16 arithmetic is opt-in (`?precision=f16`, diagnostics): the fp16 export fails the self-check (MusicGen
+  // overflows in float16), so offering it by default would only cost a 635 MB download before falling back.
+  const f16 = backend !== "cpu" && params.get("precision") === "f16";
+  const attempts = [
+    ...(f16 ? [{ backend, precision: "f16" }] : []),
+    ...(backend !== "cpu" ? [{ backend, precision: "q4" }] : []),
+    { backend: "cpu", precision: "q4" },
+  ];
+  return new WorkerVoice(onLoading, forced ? attempts.slice(0, 1) : attempts);
 }
 
 /** A message for the listener when an engine error is a crash rather than an ordinary failure. */
