@@ -62,7 +62,7 @@ Planned: `crates/plugin` (nih-plug CLAP, wrapped to VST3/AU with clap-wrapper), 
 - The tokenizer is checked against the Rust `tokenizers` crate (`npm test`; fixtures from `--example tokenize`).
 - `vite preview` does not pick up a rebuild; restart it. Unregister the service worker when testing a new build.
 - Hosting: Cloudflare Pages, Git-connected to raskell-io/driftscape: root directory `web`, build command
-  `npm run build`, output `build`, NODE_VERSION 24; Rust comes from rust-toolchain.toml. Presets are exported by
+  `npm run build`, output `build`, NODE_VERSION 24. The image has no Rust: prepare-assets.sh installs rustup, which reads rust-toolchain.toml. Presets are exported by
   `cargo run -p driftscape-core --example presets` so the Pages build never compiles the CLI (ONNX Runtime, ALSA).
   Domain: driftscape.raskell.io. `mise run deploy` uploads a local build by hand.
 - App icons are rendered from static/icon.svg with headless Chrome (ImageMagick renders this SVG extremely slowly).

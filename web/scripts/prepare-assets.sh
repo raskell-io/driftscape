@@ -8,8 +8,16 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 root=..
 
+# Cloudflare Pages' build image has Node but no Rust: install rustup there. Cargo runs from the repository root so
+# rustup picks the pinned toolchain (and the wasm target) from rust-toolchain.toml.
+if ! command -v cargo >/dev/null; then
+  [ -x "$HOME/.cargo/bin/cargo" ] || curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --default-toolchain none
+  export PATH="$HOME/.cargo/bin:$PATH"
+fi
+cargo() { (cd "$root" && command cargo "$@"); }
+
 BUDGET=${WASM_BUDGET_BYTES:-65536}
-cargo build --release --target wasm32-unknown-unknown -p driftscape-wasm --manifest-path "$root/Cargo.toml"
+cargo build --release --target wasm32-unknown-unknown -p driftscape-wasm
 in="$root/target/wasm32-unknown-unknown/release/driftscape_wasm.wasm"
 mkdir -p static/wasm
 if command -v wasm-opt >/dev/null; then wasm-opt -O3 --enable-bulk-memory --enable-nontrapping-float-to-int "$in" -o static/wasm/driftscape.wasm; else cp "$in" static/wasm/driftscape.wasm; fi
@@ -17,7 +25,7 @@ size=$(wc -c < static/wasm/driftscape.wasm | tr -d ' ')
 echo "driftscape.wasm: $size bytes (budget $BUDGET)"
 [ "$size" -le "$BUDGET" ] || { echo "over the size budget"; exit 1; }
 
-cargo run --release -q -p driftscape-core --example presets --manifest-path "$root/Cargo.toml" > static/presets.json
+cargo run --release -q -p driftscape-core --example presets > static/presets.json
 
 # Three ONNX Runtime builds: WebGPU through its native (asyncify) implementation for Chrome, Edge and Safari; WebGPU
 # through its JavaScript implementation (jsep), tried first in Firefox, where the native one crashes; and the CPU-only
