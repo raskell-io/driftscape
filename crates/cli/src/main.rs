@@ -1,13 +1,16 @@
 //! `driftscape`: the command-line way into the engine.
 
 mod generate;
+mod live;
 mod play;
+mod recorder;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use driftscape_core::{
     Audio,
     looping::{LoopSpec, make_loop},
+    preset,
     resample::resample,
     tempo,
     wav::{self, SampleFormat},
@@ -42,6 +45,22 @@ enum Command {
         /// Run the model on the GPU or the CPU.
         #[arg(long, value_enum, default_value_t = Device::Gpu)]
         device: Device,
+    },
+    /// Play endless music, generated as it plays. Type while it plays to steer it.
+    Live {
+        /// What it should sound like. Defaults to the genre's own prompt.
+        prompt: Vec<String>,
+        /// Genre preset: ambient, synthetic-ambience, realistic-ambience, ambient-techno, thematic.
+        #[arg(short, long, default_value = "ambient")]
+        genre: String,
+        #[command(flatten)]
+        session: SessionArgs,
+    },
+    /// Tune in to a station. Without a name, list the stations.
+    Radio {
+        station: Option<String>,
+        #[command(flatten)]
+        session: SessionArgs,
     },
     /// Turn an audio clip into a seamless loop.
     ///
@@ -78,6 +97,34 @@ enum Command {
     Info { input: PathBuf },
 }
 
+#[derive(clap::Args)]
+struct SessionArgs {
+    /// Run the model on the GPU or the CPU.
+    #[arg(long, value_enum, default_value_t = Device::Gpu)]
+    device: Device,
+    /// Where to save the recording of the session. Defaults to ~/Music/Driftscape.
+    #[arg(long, conflicts_with = "no_record")]
+    record: Option<PathBuf>,
+    /// Don't record the session.
+    #[arg(long)]
+    no_record: bool,
+    /// Stop by itself after this many minutes, like a sleep timer.
+    #[arg(long)]
+    stop_after: Option<f64>,
+}
+
+impl SessionArgs {
+    fn record_path(&self, name: &str) -> Option<PathBuf> {
+        if self.no_record {
+            return None;
+        }
+        self.record.clone().or_else(|| {
+            let dir = dirs::audio_dir().or_else(dirs::home_dir)?.join("Driftscape");
+            Some(dir.join(format!("driftscape-{name}-{}.wav", recorder::timestamp())))
+        })
+    }
+}
+
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum Device {
     Gpu,
@@ -112,6 +159,38 @@ impl From<Format> for SampleFormat {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::Live { prompt, genre, session } => {
+            let genre = find_genre(&genre)?;
+            let record = session.record_path(&genre.id);
+            live::run(live::Options {
+                source: live::Source::Live { genre, prompt: prompt.join(" ") },
+                backend: session.device.into(),
+                record,
+                stop_after: session.stop_after,
+            })?;
+        }
+        Command::Radio { station, session } => {
+            let stations = preset::builtin_stations();
+            let Some(id) = station else {
+                println!("stations:");
+                for s in &stations {
+                    println!("  {:<14} {} ({})", s.id, s.description, s.genre);
+                }
+                return Ok(());
+            };
+            let station = stations
+                .into_iter()
+                .find(|s| s.id == id)
+                .with_context(|| format!("no station `{id}`; run `driftscape radio` to list them"))?;
+            let genre = find_genre(&station.genre)?;
+            let record = session.record_path(&station.id);
+            live::run(live::Options {
+                source: live::Source::Radio { station, genre },
+                backend: session.device.into(),
+                record,
+                stop_after: session.stop_after,
+            })?;
+        }
         Command::Gen { prompt, output, seconds, seed, guidance, device } => {
             let seed = seed.unwrap_or_else(|| {
                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64)
@@ -172,6 +251,15 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn find_genre(id: &str) -> Result<preset::Genre> {
+    let genres = preset::builtin_genres();
+    let ids: Vec<String> = genres.iter().map(|g| g.id.clone()).collect();
+    genres
+        .into_iter()
+        .find(|g| g.id == id)
+        .with_context(|| format!("no genre `{id}`; choose one of {}", ids.join(", ")))
 }
 
 fn read(path: &Path) -> Result<Audio> {

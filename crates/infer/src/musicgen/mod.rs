@@ -15,7 +15,7 @@ pub mod gpu;
 pub mod onnx;
 
 use crate::{
-    Progress, Request, Voice,
+    Clip, Progress, Request, Tokens, Voice,
     sampling::{Rng, top_k},
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -119,12 +119,34 @@ fn forced_pad(k: usize, p: usize, len: usize) -> bool {
     p <= k || p >= len - CODEBOOKS + 1 + k
 }
 
+/// The token codebook `k` must take at position `p`, if it is not the model's to choose: the pad token outside the
+/// codebook's window, or the continuation prefix's token for frames inside the prefix.
+fn forced_token(k: usize, p: usize, len: usize, prefix: Option<&Tokens>) -> Option<i64> {
+    if forced_pad(k, p, len) {
+        return Some(PAD);
+    }
+    let frame = p - k - 1; // codebook k is delayed by k positions after the start token
+    prefix.and_then(|t| t.codebooks[k].get(frame).copied())
+}
+
 impl Voice for MusicGen {
-    fn generate(&mut self, request: &Request, progress: &mut dyn FnMut(Progress)) -> Result<Audio> {
-        if !(0.5..=MAX_SECONDS).contains(&request.seconds) {
-            bail!("MusicGen makes clips from 0.5 to {MAX_SECONDS} seconds; asked for {}", request.seconds);
+    fn generate(&mut self, request: &Request, progress: &mut dyn FnMut(Progress)) -> Result<Clip> {
+        let prefix = request.continue_from.as_ref();
+        let prefix_frames = prefix.map_or(0, Tokens::frames);
+        if let Some(t) = prefix
+            && (t.codebooks.len() != CODEBOOKS || t.codebooks.iter().any(|c| c.len() != prefix_frames))
+        {
+            bail!("continuation tokens must have {CODEBOOKS} codebooks of equal length");
         }
-        let frames = (request.seconds * FRAME_RATE).round() as usize;
+        let new_frames = (request.seconds * FRAME_RATE).round() as usize;
+        let frames = prefix_frames + new_frames;
+        if new_frames == 0 || frames as f32 > MAX_SECONDS * FRAME_RATE {
+            bail!(
+                "MusicGen makes up to {MAX_SECONDS} seconds including the continuation; asked for {} + {:.1}",
+                request.seconds,
+                prefix_frames as f32 / FRAME_RATE
+            );
+        }
         // Sequence positions: one start token, then `frames + CODEBOOKS - 1` steps to fill the staggered codebooks.
         let len = frames + CODEBOOKS;
         let steps = len - 1;
@@ -150,8 +172,8 @@ impl Voice for MusicGen {
         for p in 1..=steps {
             let logits = self.decoder.step(&next).with_context(|| format!("decoder step {p}"))?;
             for (k, sequence) in tokens.iter_mut().enumerate() {
-                let token = if forced_pad(k, p, len) {
-                    PAD
+                let token = if let Some(t) = forced_token(k, p, len, prefix) {
+                    t
                 } else {
                     let (cond, uncond) = (&logits[k * VOCAB..][..VOCAB], &logits[(CODEBOOKS + k) * VOCAB..][..VOCAB]);
                     for ((g, c), u) in guided.iter_mut().zip(cond).zip(uncond) {
@@ -168,13 +190,18 @@ impl Voice for MusicGen {
         trace("decoder", t0);
 
         // Undo the stagger: codebook k's frames sit at positions k+1 ..= k+frames.
-        let codes: Vec<i64> = (0..CODEBOOKS).flat_map(|k| tokens[k][k + 1..=k + frames].iter().copied()).collect();
+        let codebooks: Vec<Vec<i64>> = (0..CODEBOOKS).map(|k| tokens[k][k + 1..=k + frames].to_vec()).collect();
+        let codes: Vec<i64> = codebooks.iter().flatten().copied().collect();
         let t0 = std::time::Instant::now();
         let outputs =
             self.codec.run(ort::inputs!["audio_codes" => Tensor::from_array(([1, 1, CODEBOOKS, frames], codes))?])?;
         let (_, samples) = outputs["audio_values"].try_extract_tensor::<f32>()?;
         trace("audio codec", t0);
-        Ok(Audio::mono(SAMPLE_RATE, samples.to_vec()))
+        Ok(Clip {
+            audio: Audio::mono(SAMPLE_RATE, samples.to_vec()),
+            tokens: Tokens { codebooks, frame_rate: FRAME_RATE },
+            overlap_seconds: prefix_frames as f32 / FRAME_RATE,
+        })
     }
 }
 
@@ -189,6 +216,23 @@ mod tests {
         for k in 0..CODEBOOKS {
             let free: Vec<usize> = (0..len).filter(|&p| !forced_pad(k, p, len)).collect();
             assert_eq!(free, (k + 1..=k + frames).collect::<Vec<_>>(), "codebook {k}");
+        }
+    }
+
+    #[test]
+    fn continuation_prefix_is_replayed_in_delay_order() {
+        // 3 prefix frames, 2 new: codebook k must replay prefix frame f at position f + k + 1, then be free.
+        let prefix = Tokens {
+            codebooks: (0..CODEBOOKS).map(|k| (0..3).map(|f| (k * 10 + f) as i64).collect()).collect(),
+            frame_rate: 50.0,
+        };
+        let len = 5 + CODEBOOKS;
+        for k in 0..CODEBOOKS {
+            for f in 0..3 {
+                assert_eq!(forced_token(k, f + k + 1, len, Some(&prefix)), Some((k * 10 + f) as i64));
+            }
+            assert_eq!(forced_token(k, 3 + k + 1, len, Some(&prefix)), None, "first new frame of codebook {k}");
+            assert_eq!(forced_token(k, k, len, Some(&prefix)), Some(PAD));
         }
     }
 }

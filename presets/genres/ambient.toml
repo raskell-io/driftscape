@@ -1,0 +1,12 @@
+# Ambient: the genre itself. Pads, slow harmony, space.
+id = "ambient"
+name = "Ambient"
+description = "Slow harmony, soft pads and a lot of space."
+# {prompt} is replaced with what the listener types. The rest steers the model toward the genre.
+template = "{prompt}. Ambient music, slow evolving pads, soft warm textures, gentle harmony, spacious reverb, no drums"
+default_prompt = "dusk over a quiet harbour"
+guidance = 3.0
+temperature = 1.0
+segment_seconds = 12.0
+overlap_seconds = 3.0
+crossfade_seconds = 2.5

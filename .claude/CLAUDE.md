@@ -9,10 +9,13 @@ The Phoenix LiveView prototype lives on the `platform` branch.
 ## Layout
 
 ```
-crates/core/   pure audio work: WAV, resampling, tempo, seamless loops. No I/O, no model code, no threads.
+crates/core/   pure audio work: WAV, resampling, tempo, seamless loops and rejoin points, the real-time mixer and
+               leveler, genre/station presets. No I/O, no model code, no threads.
 crates/infer/  voices. MusicGen: text encoder + EnCodec on ONNX Runtime (q4 files from Xenova/musicgen-small),
                decoder on candle/Metal (gpu.rs, facebook/musicgen-small safetensors) or ONNX on CPU (onnx.rs)
-crates/cli/    the `driftscape` binary (gen, loop, play, info)
+crates/cli/    the `driftscape` binary: live, radio, gen, loop, play, info. live.rs runs live and radio mode
+               (generator thread, control loop, audio callback, recorder thread).
+presets/       genres/*.toml and stations/*.toml, compiled into core (preset.rs lists them)
 ```
 
 Models live in `~/Library/Application Support/Driftscape/models/musicgen-small/` (`onnx/`, `tokenizer.json`,
@@ -20,6 +23,15 @@ Models live in `~/Library/Application Support/Driftscape/models/musicgen-small/`
 
 Planned: `crates/wasm` (C ABI over core, no wasm-bindgen),
 `crates/plugin` (nih-plug CLAP, wrapped to VST3/AU with clap-wrapper), `web/` (SvelteKit, adapter-static).
+
+## Live mode
+
+- Each segment continues from the previous one's last `overlap_seconds` of tokens, so its first frames reproduce
+  the previous tail (measured: 0.99 correlation, zero lag; `--example continuation`). The crossfade sits in that overlap.
+- If the next segment is late, the control loop crossfades back to the current segment's `rejoin` point (bar-aligned
+  for genres with `bpm`). The next segment still continues from the buffer's end, which comes round again.
+- The audio callback only applies commands and mixes; buffers are freed on the control thread.
+- Adding a preset: drop a TOML file in `presets/` and list it in `crates/core/src/preset.rs`; the tests check it.
 
 ## Rules
 

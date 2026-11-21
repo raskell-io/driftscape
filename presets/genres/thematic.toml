@@ -1,0 +1,12 @@
+# Thematic: inspired by soundtracks of games, films and pop culture. The template describes a style; prompts and
+# stations should name instruments, eras and moods rather than specific works.
+id = "thematic"
+name = "Thematic"
+description = "Inspired by soundtracks: game worlds, film scores, shows."
+template = "{prompt}. Soundtrack style background music, instrumental, loopable, calm, no vocals"
+default_prompt = "16-bit fantasy role-playing game overworld, gentle flute and harp, chiptune textures"
+guidance = 3.5
+temperature = 1.0
+segment_seconds = 12.0
+overlap_seconds = 3.0
+crossfade_seconds = 2.0

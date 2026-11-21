@@ -1,0 +1,11 @@
+id = "overworld"
+name = "Overworld"
+description = "Calm fields and villages of an imagined 16-bit adventure."
+genre = "thematic"
+prompts = [
+  "16-bit fantasy overworld, gentle flute and harp, chiptune textures",
+  "peaceful village at sunset, music box and soft strings",
+  "forest path, light woodwinds and plucked strings",
+  "inn by the road, warm lute and quiet percussion",
+]
+segments_per_prompt = 2

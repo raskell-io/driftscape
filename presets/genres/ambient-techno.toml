@@ -1,0 +1,12 @@
+# Ambient techno: ambient with a soft, steady beat. The tempo is part of the prompt and repeats rejoin on whole bars.
+id = "ambient-techno"
+name = "Ambient techno"
+description = "Pads over a soft four-on-the-floor pulse."
+template = "{prompt}. Ambient techno at {bpm} BPM, soft deep kick drum on every beat, muted hi-hats, warm dub chords, long reverb tails, steady groove"
+default_prompt = "late night drive through a sleeping city"
+guidance = 3.0
+temperature = 1.0
+segment_seconds = 12.0
+overlap_seconds = 3.0
+crossfade_seconds = 1.0
+bpm = 118.0

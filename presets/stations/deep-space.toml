@@ -1,0 +1,11 @@
+id = "deep-space"
+name = "Deep Space"
+description = "Drones and distant signals between the stars."
+genre = "synthetic-ambience"
+prompts = [
+  "observation deck of a slow starship, distant nebula",
+  "radio silence between stars, faint signals",
+  "drifting past a gas giant, vast and slow",
+  "cryosleep chamber, soft humming machinery",
+]
+segments_per_prompt = 3

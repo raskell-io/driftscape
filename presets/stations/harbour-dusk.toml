@@ -1,0 +1,11 @@
+id = "harbour-dusk"
+name = "Harbour Dusk"
+description = "Warm pads drifting over water as the light goes."
+genre = "ambient"
+prompts = [
+  "dusk over a quiet harbour, gentle water",
+  "lanterns coming on along the pier, warm glow",
+  "fog rolling in from the sea, muted and calm",
+  "the last boat returning, soft bells far away",
+]
+segments_per_prompt = 3

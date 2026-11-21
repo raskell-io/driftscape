@@ -123,6 +123,41 @@ pub fn crossfade_join(current: &Audio, next: &Audio, crossfade: usize) -> Audio 
     Audio::new(current.sample_rate, channels)
 }
 
+/// Where to jump back to when a clip has to repeat.
+///
+/// Playback is about to cross from `from` onwards; the result is an earlier frame `s` in `earliest..=latest` whose
+/// next `window` frames sound most like `samples[from..from + window]`, so a crossfade from `from` to `s` is smooth.
+/// With `bar` (frames per bar), only starts a whole number of bars before `from` are considered, so a beat keeps its
+/// place. Returns the frame and its similarity (-1 to 1); `None` when no candidate fits.
+pub fn rejoin_point(
+    samples: &[f32],
+    from: usize,
+    window: usize,
+    earliest: usize,
+    latest: usize,
+    bar: Option<usize>,
+) -> Option<(usize, f32)> {
+    if from + window > samples.len() || earliest > latest {
+        return None;
+    }
+    let target = &samples[from..from + window];
+    let latest = latest.min(from.saturating_sub(window));
+    let score = |s: usize| similarity(&samples[s..s + window], target);
+    let pick = |candidates: &mut dyn Iterator<Item = usize>| {
+        candidates.map(|s| (s, score(s))).max_by(|a, b| a.1.total_cmp(&b.1))
+    };
+    match bar {
+        Some(bar) if bar > 0 => {
+            pick(&mut (1..=from / bar).map(|n| from - n * bar).filter(|s| (earliest..=latest).contains(s)))
+        }
+        _ => {
+            const STEP: usize = 64;
+            let (coarse, _) = pick(&mut (earliest..=latest).step_by(STEP))?;
+            pick(&mut (coarse.saturating_sub(STEP).max(earliest)..=(coarse + STEP).min(latest)))
+        }
+    }
+}
+
 /// Gains for step `i` of `n` in an equal-power crossfade: (rising, falling), with rising² + falling² = 1, so the
 /// blend of two unrelated sounds keeps its loudness.
 fn equal_power(i: usize, n: usize) -> (f32, f32) {
@@ -225,6 +260,23 @@ mod tests {
         let clip = sine(8000, 40.0, 1000);
         let err = make_loop(&clip, LoopSpec { length: 1000, crossfade: 10 }).unwrap_err();
         assert_eq!(err, LoopError::TooShort { needed: 1010, available: 1000 });
+    }
+
+    #[test]
+    fn rejoin_finds_the_same_phase_earlier() {
+        // A 50-frame period: the best place to jump back to from frame 3000 is a whole number of periods earlier.
+        let clip = sine(8000, 160.0, 4000);
+        let (s, sim) = rejoin_point(&clip.channels[0], 3000, 200, 0, 2500, None).unwrap();
+        assert_eq!((3000 - s) % 50, 0, "jumped to {s}");
+        assert!(sim > 0.99);
+    }
+
+    #[test]
+    fn rejoin_on_bars_only_lands_on_bar_lines() {
+        let clip = sine(8000, 160.0, 4000);
+        let (s, _) = rejoin_point(&clip.channels[0], 3000, 200, 0, 2500, Some(700)).unwrap();
+        assert_eq!((3000 - s) % 700, 0);
+        assert!(rejoin_point(&clip.channels[0], 3000, 200, 2600, 2700, Some(700)).is_none());
     }
 
     #[test]

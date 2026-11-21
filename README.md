@@ -20,21 +20,32 @@ tied to places and shift as you move. Built with Phoenix.
 
 ---
 
+## Use
+
+Driftscape runs on your own machine. On a Mac with Apple silicon it generates faster than real time on the GPU.
+
+```bash
+driftscape live "rain on a tin roof, soft guitar"     # endless, steer it by typing while it plays
+driftscape live --genre ambient-techno                # ambient, synthetic-ambience, realistic-ambience, ambient-techno, thematic
+driftscape radio                                      # list stations
+driftscape radio deep-space --stop-after 45           # a station, with a sleep timer
+driftscape gen "warm ambient pads" --seconds 10 -o pads.wav
+driftscape loop pads.wav --bars 4 -o loop.wav         # cut a seamless loop
+```
+
+Live and radio sessions are recorded to `~/Music/Driftscape` (`--record <path>` or `--no-record`).
+
+The model files (MusicGen small) go in `~/Library/Application Support/Driftscape/models/musicgen-small/`:
+`tokenizer.json` and `onnx/{text_encoder,decoder_model_merged,encodec_decode}_q4.onnx` from
+[Xenova/musicgen-small](https://huggingface.co/Xenova/musicgen-small), and `safetensors/model.safetensors` from
+[facebook/musicgen-small](https://huggingface.co/facebook/musicgen-small) for the GPU. MusicGen's weights are licensed
+CC-BY-NC 4.0.
+
 ## Development
 
-To start your Phoenix server:
+```bash
+mise run test                                         # tests, clippy, fmt
+cargo run --release -p driftscape -- live
+```
 
-* Run `mix setup` to install and setup dependencies
-* Start Phoenix endpoint with `mix phx.server` or inside IEx with `iex -S mix phx.server`
-
-Now you can visit [`localhost:4000`](http://localhost:4000) from your browser.
-
-Ready to run in production? Please [check our deployment guides](https://hexdocs.pm/phoenix/deployment.html).
-
-## Learn more
-
-* Official website: https://www.phoenixframework.org/
-* Guides: https://hexdocs.pm/phoenix/overview.html
-* Docs: https://hexdocs.pm/phoenix
-* Forum: https://elixirforum.com/c/phoenix-forum
-* Source: https://github.com/phoenixframework/phoenix
+Genres and stations are TOML files in `presets/`. The plan lives in `.claude/VISION.md`.

@@ -1,0 +1,10 @@
+id = "tavern"
+name = "Tavern"
+description = "A medieval inn on a rainy evening. Leans musical until a sound-effects voice lands."
+genre = "realistic-ambience"
+prompts = [
+  "medieval tavern, crackling fireplace, quiet murmur of voices, rain outside",
+  "medieval tavern, wooden mugs, a lute played softly in the corner",
+  "medieval tavern late at night, embers, wind against the shutters",
+]
+segments_per_prompt = 3
