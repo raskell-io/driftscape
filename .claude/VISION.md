@@ -1,37 +1,59 @@
 # Driftscape — Vision
 
-A platform in the vein of Mixcloud and Soundcloud, but purpose-built for ambient music and soundscapes.
+Re-imagined on 2026-11-21. The first version (February 2026) was a SoundCloud-style platform for ambient music; that
+Phoenix prototype lives on the `platform` branch. Driftscape is now an engine first.
 
-## Core Pillars
+## What it is
 
-### 1. Ambient-first audio platform
-Not a general music platform. Everything — UI, audio formats, social features — is shaped by the focus on ambient and background music. Music that is meant to be listened to in the background, is easily loopable, and can be extended to form soundscapes.
+A local AI music engine for ambient soundscapes. Inference always runs on the listener's own machine, so it costs us
+nothing to run and works offline. One Rust core, four ways in:
 
-### 2. Minimal footprint
-Highly compressed but still well-sounding audio. Ambient content is more forgiving of lossy compression than vocal or melodic music, so we can push bitrates lower (e.g. Opus at 32-64 kbps) while maintaining perceived quality. Loop metadata (sample-accurate start/end points) and app-layer crossfading handle gapless playback.
+1. **CLI** (primary): `driftscape live`, `radio`, `gen`, `loop`, `play`, `serve`.
+2. **DAW plugin**: Logic Pro and Ableton Live. nih-plug CLAP, wrapped to VST3 and AUv2 with clap-wrapper.
+3. **Local web GUI**: `driftscape serve` embeds the web app and gives it the native engine.
+4. **Hosted PWA**: the same web app as static files on Cloudflare Pages, inference in the browser via WebGPU.
 
-### 3. Composable soundscapes
-Users can layer sound bites, environmental textures (beach waves, cicadas, rain, wind), and melodic loops into rich scenes. The platform should be friendly to sampling pre-existing "sound bites" — fragments from video games, famous melodies, environmental recordings — while keeping the overall focus on ambient/ambience genres.
+## Modes
 
-### 4. Client-side AI generation
-A web app that loads an AI audio model (MusicGen) into the browser via WebAssembly/WebGPU. All compute and GPU cycles happen on the client — no model serving on the backend. This keeps server costs flat and puts creative power directly in users' hands.
+The UX should be as easy as possible. Modes differ in how much control they show.
 
-### 5. Geo-aware playback
-People can curate soundscapes for specific locations. When a listener moves to a shop, a city, or a spot within a geographically bounded area, the music switches or shifts softly. Ranges from simple geofenced zones with assigned playlists to smooth spatial blending between zones (closer to a game audio engine).
+- **Live**: endless generation, played as it is made, tweakable while it plays (prompt, intensity, density,
+  brightness). The whole session is recorded and can be saved.
+- **Radio**: live mode driven by a station preset: one Driftscape ships with, one you saved, or one someone else made.
+- **Producer**: a tiny, focused DAW. Segments on a timeline you can go back to, regenerate, extend, layer and export.
 
-### 6. Preference-driven experience
-A wholesome, always-on background music experience tailored to individual taste. Some people want game-inspired music, others medieval/fantasy soundscapes, futuristic or cyberpunk atmospheres. The platform adapts to user profiles and preferences, ensuring an appropriate ambient backdrop at all times.
+Live mode never stalls: the current segment loops seamlessly until the next one (a continuation of it, with the latest
+tweaks) is ready, then a bar-aligned crossfade brings it in. Generation speed only decides how often a repeat happens.
 
-## Domain
-`driftscape.live` or `driftscape.audio`
+## Genres
 
-## First Milestone
-**Client-side AI audio engine** — the riskiest and most novel piece. De-risk the hardest technical challenge first: getting MusicGen running in the browser via Transformers.js + WebGPU, with Web Audio API playback, seamless looping, and crossfade.
+A genre is a plain TOML preset that informs every mode: a prompt template that wraps the user's words (a system prompt
+for the model), the voice, and defaults for segment length, tempo, crossfade and sampling.
 
-## Future Milestones
-- User accounts and auth
-- Audio upload and storage (S3-compatible)
-- Soundscape composition (layering multiple loops and sound bites)
-- Geo-aware playback with location-based soundscape switching
-- Mobile PWA
-- Social features (following, sharing, collaborative soundscapes)
+- **Realistic ambience**: rain, cave, campfire, medieval tavern. Needs a sound-effects-capable voice (Stable Audio
+  Open), or a CC0 field-recording bed; MusicGen is music-only.
+- **Synthetic ambience**: synth textures and melodic drones.
+- **Ambient**: the genre itself.
+- **Ambient techno**: ambient with a soft beat; fixed session tempo, segments stretched and cut on bars.
+- **Thematic**: inspired by soundtracks of games, films and pop culture. The template translates a reference into
+  style words (instrumentation, era, mood, production). Presets describe styles ("16-bit fantasy overworld", "80s synth
+  sci-fi score") and never name or imitate a specific work.
+
+## Decisions
+
+- Voices are swappable. MusicGen small first (weights CC-BY-NC 4.0, so no paid tier with it); Stable Audio Open Small
+  next (Stability Community License, free under $1M revenue).
+- Stations and genres are files. Shipped ones live in the repo; community ones in a static catalogue. No accounts yet.
+- Native inference via ONNX Runtime (`ort`), browser inference via onnxruntime-web; both load the same model files.
+
+## Order of work
+
+1. Core and native generation: loops, tempo, resampling (done); MusicGen via ort, model cache, `gen`, real-time factor.
+2. Live and radio in the CLI: evolving loop, continuation, tweaks, recording, presets, time-stretch.
+3. Realistic-ambience voice.
+4. Web: hosted PWA and `driftscape serve`.
+5. Producer mode.
+6. Plugin.
+
+Later, maybe: location-aware playback (soundscapes tied to places) and a platform for sharing, as separate consumers of
+the engine.

@@ -1,0 +1,13 @@
+[package]
+name = "driftscape-wasm"
+description = "Driftscape's core for the browser: a plain C ABI over driftscape-core, no wasm-bindgen."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+driftscape-core = { path = "../core" }

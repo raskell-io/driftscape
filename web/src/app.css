@@ -1,0 +1,44 @@
+/* Driftscape: dusk palette from the brand icon, Sora for display, Inter for text, JetBrains Mono for labels and data.
+   One dark look: the app is an instrument, and people listen at night. */
+:root {
+  --bg: #17142c;
+  --surface: #201c3a;
+  --raised: #2a2448;
+  --ink: #f4e6dc;
+  --muted: #b4a9c6;
+  --line: #352f57;
+  --peach: #ffb08f;
+  --rose: #e48bb0;
+  --violet: #a993f0;
+  --apricot: #ffd3a1;
+  --accent: var(--peach);
+  --on-accent: #24204a;
+  --good: #6fd0a2;
+  --dusk: linear-gradient(90deg, #ffd3a1, #f2a98c, #dc8a9b, #b06fb0, #7d5bbd, #5b4a9e);
+  --display: "Sora Variable", "Inter Variable", system-ui, sans-serif;
+  --body: "Inter Variable", system-ui, -apple-system, sans-serif;
+  --mono: "JetBrains Mono Variable", ui-monospace, "SF Mono", Menlo, monospace;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font: 16px/1.55 var(--body);
+  -webkit-font-smoothing: antialiased;
+}
+.app { min-height: 100%; }
+main {
+  max-width: 880px;
+  margin: 0 auto;
+  padding-block: 0 4rem;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+button, input, select { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+.skip { position: absolute; left: -9999px; }
+.skip:focus { left: 16px; top: 16px; background: var(--surface); padding: 0.5rem 0.75rem; border-radius: 8px; z-index: 10; }
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }

@@ -1,0 +1,11 @@
+id = "night-drive"
+name = "Night Drive"
+description = "A soft pulse for empty streets after midnight."
+genre = "ambient-techno"
+prompts = [
+  "late night drive through a sleeping city",
+  "tunnel lights passing in rhythm",
+  "rain on the windshield, neon reflections",
+  "highway at 4am, first hint of dawn",
+]
+segments_per_prompt = 3

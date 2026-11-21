@@ -1,0 +1,14 @@
+# Realistic ambience: places as they sound. MusicGen is trained on music, so this genre leans musical until a
+# sound-effects voice (Stable Audio Open) is added; the template asks for field-recording character to help.
+id = "realistic-ambience"
+name = "Realistic ambience"
+description = "Places as they sound: rain, caves, campfires, taverns."
+template = "{prompt}. Field recording ambience, natural environmental sounds, realistic room tone, very quiet soft drone underneath, no melody, no drums"
+# A few words that carry this genre into a blend with another (the terrain pad in the web app).
+flavor = "natural field recording textures"
+default_prompt = "steady rain on leaves, distant thunder"
+guidance = 3.5
+temperature = 0.95
+segment_seconds = 12.0
+overlap_seconds = 3.0
+crossfade_seconds = 2.5
