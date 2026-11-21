@@ -61,6 +61,9 @@ Planned: `crates/plugin` (nih-plug CLAP, wrapped to VST3/AU with clap-wrapper), 
 - onnxruntime-web refuses to create WebGPU sessions concurrently: create them one by one.
 - The tokenizer is checked against the Rust `tokenizers` crate (`npm test`; fixtures from `--example tokenize`).
 - `vite preview` does not pick up a rebuild; restart it. Unregister the service worker when testing a new build.
+- Hosting: Cloudflare Pages project `driftscape-raskell-io` (direct upload; the build needs Rust and Node, so it is not
+  Git-connected). `mise run deploy` builds and uploads. Domain: driftscape.raskell.io.
+- App icons are rendered from static/icon.svg with headless Chrome (ImageMagick renders this SVG extremely slowly).
 - The app picks NativeVoice when `/api/health` answers `{"engine":"driftscape"}`, else WorkerVoice.
 
 ## Rules
