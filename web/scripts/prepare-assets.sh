@@ -17,7 +17,7 @@ size=$(wc -c < static/wasm/driftscape.wasm | tr -d ' ')
 echo "driftscape.wasm: $size bytes (budget $BUDGET)"
 [ "$size" -le "$BUDGET" ] || { echo "over the size budget"; exit 1; }
 
-cargo run --release -q -p driftscape --manifest-path "$root/Cargo.toml" -- presets --json > static/presets.json
+cargo run --release -q -p driftscape-core --example presets --manifest-path "$root/Cargo.toml" > static/presets.json
 
 # Three ONNX Runtime builds: WebGPU through its native (asyncify) implementation for Chrome, Edge and Safari; WebGPU
 # through its JavaScript implementation (jsep), tried first in Firefox, where the native one crashes; and the CPU-only

@@ -61,8 +61,10 @@ Planned: `crates/plugin` (nih-plug CLAP, wrapped to VST3/AU with clap-wrapper), 
 - onnxruntime-web refuses to create WebGPU sessions concurrently: create them one by one.
 - The tokenizer is checked against the Rust `tokenizers` crate (`npm test`; fixtures from `--example tokenize`).
 - `vite preview` does not pick up a rebuild; restart it. Unregister the service worker when testing a new build.
-- Hosting: Cloudflare Pages project `driftscape-raskell-io` (direct upload; the build needs Rust and Node, so it is not
-  Git-connected). `mise run deploy` builds and uploads. Domain: driftscape.raskell.io.
+- Hosting: Cloudflare Pages, Git-connected to raskell-io/driftscape: root directory `web`, build command
+  `npm run build`, output `build`, NODE_VERSION 24; Rust comes from rust-toolchain.toml. Presets are exported by
+  `cargo run -p driftscape-core --example presets` so the Pages build never compiles the CLI (ONNX Runtime, ALSA).
+  Domain: driftscape.raskell.io. `mise run deploy` uploads a local build by hand.
 - App icons are rendered from static/icon.svg with headless Chrome (ImageMagick renders this SVG extremely slowly).
 - Persistence (web/src/lib/store.js, IndexedDB): settings; a snapshot of the playing segment (audio + tokens) so
   "Continue where you left off" plays at once and generates on from its tokens; recordings written in 2 s chunks, so a

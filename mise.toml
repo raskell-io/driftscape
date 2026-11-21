@@ -21,6 +21,6 @@ depends = ["web"]
 run = "cargo run --release -p driftscape -- serve"
 
 [tasks.deploy]
-description = "Build the web app and deploy it to Cloudflare Pages (driftscape.raskell.io); needs `wrangler login`"
+description = "Deploy a local build by hand (Cloudflare Pages normally builds main itself); needs `wrangler login`"
 depends = ["web"]
 run = "wrangler pages deploy web/build --project-name driftscape-raskell-io --branch main --commit-hash $(git rev-parse HEAD)"
