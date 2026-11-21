@@ -17,6 +17,7 @@ cpal = "0.18.2"
 ctrlc = "3.5.3"
 dirs = "7.0.0"
 driftscape-core = { path = "../core" }
+driftscape-engine = { path = "../engine" }
 driftscape-infer = { version = "0.1.0", path = "../infer" }
 ort = "2.0.0-rc.15"
 rtrb = "0.4.1"

@@ -13,7 +13,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev   # cpal (audio output) on Linux
+      # cpal (audio output); the plugin's editor (baseview: X11, XCB, OpenGL); JACK for nih-plug
+      - run: >-
+          sudo apt-get update && sudo apt-get install -y libasound2-dev libx11-dev libx11-xcb-dev libxcb1-dev
+          libxcb-dri2-0-dev libxcb-icccm4-dev libxcursor-dev libxkbcommon-dev libgl-dev libjack-dev
       - run: rustup toolchain install   # the toolchain from rust-toolchain.toml
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
