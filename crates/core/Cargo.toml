@@ -1,0 +1,8 @@
+[package]
+name = "driftscape-core"
+description = "Driftscape's audio core: seamless loops, tempo, resampling, WAV. Pure and target-independent."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]

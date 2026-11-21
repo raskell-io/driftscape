@@ -1,0 +1,7 @@
+[tasks.test]
+description = "Test the workspace and lint it"
+run = ["cargo test --workspace", "cargo clippy --workspace --all-targets -- -D warnings", "cargo fmt --check"]
+
+[tasks.install]
+description = "Install the driftscape CLI into ~/.cargo/bin"
+run = "cargo install --path crates/cli --locked"

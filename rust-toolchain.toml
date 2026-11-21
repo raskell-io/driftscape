@@ -1,0 +1,5 @@
+# Pinned, with the wasm target for the PWA build, so every machine and CI builds the same thing.
+[toolchain]
+channel = "1.99.1"
+targets = ["wasm32-unknown-unknown"]
+components = ["rustfmt", "clippy"]
