@@ -10,7 +10,7 @@
     "dev": "npm run prepare-assets && vite dev",
     "build": "npm run prepare-assets && vite build",
     "preview": "vite preview",
-    "test": "node --test src/lib"
+    "test": "node --test \"src/lib/**/*.test.js\""
   },
   "dependencies": {
     "onnxruntime-web": "1.31.1",
