@@ -52,7 +52,8 @@ for the model), the voice, and defaults for segment length, tempo, crossfade and
 2. Live and radio in the CLI: evolving loop, continuation, tweaks, recording, presets, time-stretch.
 3. Realistic-ambience voice.
 4. Web: hosted PWA and `driftscape serve`.
-5. Producer mode.
+5. Producer mode: a rack of layers on a timeline; takes generated, regenerated, extended, trimmed, faded, exported
+   (done in the web app; `driftscape render` mixes the same arrangement format).
 6. Plugin.
 
 Later, maybe: location-aware playback (soundscapes tied to places) and a platform for sharing, as separate consumers of

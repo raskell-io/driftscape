@@ -3,22 +3,26 @@
 //   session     a snapshot of the segment playing now (its audio and tokens), so a session can resume where it left
 //               off: the snapshot plays at once and generation continues from its tokens
 //   recordings  recordings, written in chunks while they are made, so a reload or a crash loses nothing
+//   project     producer mode's piece (its tracks and clips), and in "takes" the generated audio its clips play
 //
 // The model itself is in Cache Storage (the voice worker's "driftscape-models-v1"); see storage() below.
 
 const DB = "driftscape";
-const VERSION = 1;
+const VERSION = 2;
 
 let dbPromise = null;
 function db() {
   dbPromise ??= new Promise((resolve, reject) => {
     const req = indexedDB.open(DB, VERSION);
-    req.onupgradeneeded = () => {
+    req.onupgradeneeded = (e) => {
       const d = req.result;
-      d.createObjectStore("kv"); // settings, session
-      d.createObjectStore("recordings", { keyPath: "id" });
-      const chunks = d.createObjectStore("chunks", { keyPath: ["recording", "seq"] });
-      chunks.createIndex("recording", "recording");
+      if (e.oldVersion < 1) {
+        d.createObjectStore("kv"); // settings, session, project
+        d.createObjectStore("recordings", { keyPath: "id" });
+        const chunks = d.createObjectStore("chunks", { keyPath: ["recording", "seq"] });
+        chunks.createIndex("recording", "recording");
+      }
+      if (e.oldVersion < 2) d.createObjectStore("takes", { keyPath: "id" });
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -68,6 +72,24 @@ export const saveSettings = (settings) => put("settings", settings).catch(() => 
 export const loadSession = () => get("session").catch(() => undefined);
 export const saveSession = (snapshot) => put("session", snapshot).catch(() => {});
 export const clearSession = () => put("session", undefined).catch(() => {});
+
+// ---- producer ----------------------------------------------------------------------------------------------------
+
+/**
+ * @typedef {object} Take
+ * @property {string} id
+ * @property {Float32Array[]} channels   loudness already applied
+ * @property {number} sampleRate
+ * @property {number[][] | null} codebooks  the voice's tokens, so the take can be extended
+ * @property {number[][] | null} continuedFrom  the tokens it continued, so regenerating continues the same way
+ * @property {Float32Array} peaks        PEAKS_PER_SECOND levels for drawing
+ */
+
+export const loadProject = () => get("project").catch(() => undefined);
+export const saveProject = (project) => put("project", project).catch(() => {});
+export const saveTake = (take) => tx("takes", "readwrite", (t) => t.objectStore("takes").put(take));
+export const loadTake = (id) => tx("takes", "readonly", (t) => t.objectStore("takes").get(id));
+export const deleteTake = (id) => tx("takes", "readwrite", (t) => t.objectStore("takes").delete(id)).catch(() => {});
 
 // ---- recordings --------------------------------------------------------------------------------------------------
 

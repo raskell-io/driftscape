@@ -250,7 +250,7 @@ impl Leveler {
 }
 
 /// Unity below 0.8, then a smooth curve that approaches but never reaches 1.0.
-fn soft_limit(x: f32) -> f32 {
+pub(crate) fn soft_limit(x: f32) -> f32 {
     const KNEE: f32 = 0.8;
     let a = x.abs();
     if a <= KNEE {

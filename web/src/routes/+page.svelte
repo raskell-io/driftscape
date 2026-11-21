@@ -7,9 +7,10 @@
   import Terrain from "#lib/ui/Terrain.svelte";
   import Knob from "#lib/ui/Knob.svelte";
   import Receiver from "#lib/ui/Receiver.svelte";
+  import Rack from "#lib/ui/Rack.svelte";
 
   let presets = $state({ genres: [], stations: [] });
-  let mode = $state("live"); // "live" | "radio"
+  let mode = $state("live"); // "live" | "radio" | "producer"
   let dot = $state({ x: 0.36, y: 0.5 });
   let mix = $state(null); // { genre, blend } at the dot
   let prompt = $state("");
@@ -42,6 +43,8 @@
   let online = $state(true);
 
   let engine = null;
+  let voice = null;
+  let rack = $state(null);
   let recordTimer = null;
   let sent = null; // the mix the engine is playing
 
@@ -77,7 +80,7 @@
     if (session?.audio) resumable = session;
     refreshLibrary();
 
-    const voice = await chooseVoice(({ detail, fraction }) => (engineState = { phase: "loading", detail, fraction }));
+    voice = await chooseVoice(({ detail, fraction }) => (engineState = { phase: "loading", detail, fraction }));
     native = voice.label.includes("engine");
     engine = new LiveEngine(voice, onEvent);
     engine.setLevel(level / 10);
@@ -160,6 +163,7 @@
   // ---- live: the terrain ----
 
   async function playLive() {
+    rack?.stop();
     begin();
     stationId = null;
     sent = mix;
@@ -200,6 +204,7 @@
 
   async function tune(id) {
     if (stationId === id && playing) return;
+    rack?.stop();
     begin();
     stationId = id;
     const s = presets.stations.find((x) => x.id === id);
@@ -219,6 +224,7 @@
     const s = presets.stations.find((x) => x.id === snap.stationId) ?? null;
     const g = presets.genres.find((x) => x.id === snap.params.genreId) ?? mix.genre;
     const b = presets.genres.find((x) => x.id === snap.params.blendId);
+    rack?.stop();
     begin();
     stationId = s?.id ?? null;
     mode = s ? "radio" : "live";
@@ -338,10 +344,11 @@
     <div class="modes" role="tablist" aria-label="Mode">
       <button role="tab" aria-selected={mode === "live"} class:active={mode === "live"} onclick={() => (mode = "live")}>Live<small>Terrain</small></button>
       <button role="tab" aria-selected={mode === "radio"} class:active={mode === "radio"} onclick={() => (mode = "radio")}>Radio<small>Receiver</small></button>
+      <button role="tab" aria-selected={mode === "producer"} class:active={mode === "producer"} onclick={() => (mode = "producer")}>Producer<small>Rack</small></button>
     </div>
-    <button class="rec" class:on={recording} onclick={toggleRecording} disabled={!playing && !recording} aria-pressed={recording}>
+    {#if mode !== "producer"}<button class="rec" class:on={recording} onclick={toggleRecording} disabled={!playing && !recording} aria-pressed={recording}>
       <span class="rec-dot"></span>{recording ? `Stop recording · ${clock(recordedSeconds)}` : "Record"}
-    </button>
+    </button>{/if}
   </div>
 
   {#if mode === "live"}
@@ -387,6 +394,10 @@
       </label>
       <button type="submit" class="pill" disabled={!engineReady}>{live ? "Steer" : "Play"}</button>
     </form>
+  {:else if mode === "producer"}
+    {#if presets.genres.length}
+      <Rack bind:this={rack} genres={presets.genres} voice={() => voice} ready={engineReady} onclaim={() => playing && stop()} />
+    {/if}
   {:else}
     <Receiver stations={presets.stations} genres={presets.genres} tunedId={stationId} onair={playing && !!stationId} onlock={tune} />
     {#if playing && stationId}
@@ -399,7 +410,7 @@
     {/if}
   {/if}
 
-  <div class="status" aria-live="polite">
+  {#if mode !== "producer"}<div class="status" aria-live="polite">
     {#if playing}
       <p class="now">
         {nowPlaying ||
@@ -418,7 +429,7 @@
     {:else if engineReady}
       {#if mode === "live"}<p class="now dim">Drag the dot to a place, then press play. Drift makes it wander.</p>{/if}
     {/if}
-  </div>
+  </div>{/if}
 </section>
 
 {#if error}<p class="error" role="alert">{error}</p>{/if}
@@ -484,7 +495,7 @@
   .resume-actions { display: flex; align-items: center; gap: 0.75rem; flex: none; }
 
   /* the instrument */
-  .instrument { margin-top: 0.75rem; padding: 18px; border-radius: 22px; display: grid; gap: 16px;
+  .instrument { margin-top: 0.75rem; padding: 18px; border-radius: 22px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px;
     background: linear-gradient(180deg, #221d3b, #18142c);
     box-shadow: 0 1px 0 rgba(255, 255, 255, 0.06) inset, 0 30px 60px -30px rgba(0, 0, 0, 0.8), 0 0 0 1px #2d2650; }
   .bar { display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap; }

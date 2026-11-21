@@ -1,12 +1,13 @@
 <script>
   // A rotary control: drag up or down (or use the arrow keys) to turn. `onchange` fires when the value settles.
-  let { label, min = 0, max = 10, step = 1, value = $bindable(0), format = (v) => String(v), onchange } = $props();
+  let { label, min = 0, max = 10, step = 1, value = $bindable(0), format = (v) => String(v), onchange, size = 58 } = $props();
 
   const t = $derived((value - min) / (max - min));
   let start = null;
   let dial;
   // Set through the DOM, not a style attribute: the page's Content Security Policy blocks inline style attributes.
   $effect(() => dial?.style.setProperty("--t", String(t)));
+  $effect(() => dial?.style.setProperty("--size", `${size}px`));
 
   const snap = (v) => Math.min(max, Math.max(min, Math.round(v / step) * step));
   function down(e) {

@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use driftscape_core::{
     Audio,
+    arrange::{self, Arrangement},
     looping::{LoopSpec, fit_loop, make_loop},
     preset,
     resample::resample,
@@ -120,6 +121,19 @@ enum Command {
         /// Output sample rate, e.g. 48000 for a DAW session. Defaults to the input's.
         #[arg(long)]
         rate: Option<u32>,
+        /// Output sample format.
+        #[arg(long, value_enum, default_value_t = Format::Pcm24)]
+        format: Format,
+    },
+    /// Mix a producer-mode project down to a WAV file.
+    ///
+    /// The project is JSON: `{"sample_rate": 48000, "sources": ["a.wav", ...], "tracks": [{"gain_db": 0, "pan": 0,
+    /// "clips": [{"source": 0, "at": 0, "offset": 0, "length": 8, "fade_in": 2, "fade_out": 2}]}]}`. Source paths are
+    /// relative to the project file.
+    Render {
+        project: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
         /// Output sample format.
         #[arg(long, value_enum, default_value_t = Format::Pcm24)]
         format: Format,
@@ -328,6 +342,21 @@ fn main() -> Result<()> {
                 Some(r) => resample(&looped.audio, r),
                 None => looped.audio,
             };
+            write(&output, &audio, format.into())?;
+            eprintln!("wrote {} ({:.2} s, {} Hz)", output.display(), audio.seconds(), audio.sample_rate);
+        }
+        Command::Render { project, output, format } => {
+            #[derive(serde::Deserialize)]
+            struct Project {
+                sources: Vec<PathBuf>,
+                #[serde(flatten)]
+                arrangement: Arrangement,
+            }
+            let text = std::fs::read_to_string(&project).with_context(|| format!("reading {}", project.display()))?;
+            let p: Project = serde_json::from_str(&text).with_context(|| format!("parsing {}", project.display()))?;
+            let base = project.parent().unwrap_or(Path::new("."));
+            let sources = p.sources.iter().map(|s| read(&base.join(s))).collect::<Result<Vec<_>>>()?;
+            let audio = arrange::render(&p.arrangement, &sources)?;
             write(&output, &audio, format.into())?;
             eprintln!("wrote {} ({:.2} s, {} Hz)", output.display(), audio.seconds(), audio.sample_rate);
         }
