@@ -4,6 +4,7 @@ description = "Driftscape command line: generate, loop and play ambient soundsca
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "driftscape"

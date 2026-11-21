@@ -4,6 +4,7 @@ description = "Driftscape's audio core: seamless loops, tempo, resampling, WAV. 
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }

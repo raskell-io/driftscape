@@ -4,6 +4,7 @@ description = "Driftscape's core for the browser: a plain C ABI over driftscape-
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [lib]
 crate-type = ["cdylib"]

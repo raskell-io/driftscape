@@ -59,3 +59,8 @@ cargo run --release -p driftscape -- live
 ```
 
 Genres and stations are TOML files in `presets/`. The plan lives in `.claude/VISION.md`.
+
+## License
+
+The code is MIT licensed (see `LICENSE`). MusicGen's model weights are a separate work, licensed CC-BY-NC 4.0
+(non-commercial) by Meta; they are downloaded from Hugging Face, not included here.
